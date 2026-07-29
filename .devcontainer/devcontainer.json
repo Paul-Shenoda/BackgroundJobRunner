@@ -1,0 +1,21 @@
+{
+  "name": "BackgroundJobRunner",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/BackgroundJobRunner",
+  "shutdownAction": "stopCompose",
+  "postCreateCommand": "pip install -r requirements.txt",
+  "forwardPorts": [5432, 8000],
+  "portsAttributes": {
+    "5432": { "label": "Postgres" },
+    "8000": { "label": "API" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  }
+}

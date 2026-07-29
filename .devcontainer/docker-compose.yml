@@ -1,0 +1,14 @@
+services:
+  postgres:
+    extends:
+      file: ../docker-compose.yml
+      service: postgres
+
+  app:
+    image: mcr.microsoft.com/devcontainers/python:3.12
+    volumes:
+      - ..:/workspaces/BackgroundJobRunner:cached
+    command: sleep infinity
+    depends_on:
+      postgres:
+        condition: service_healthy

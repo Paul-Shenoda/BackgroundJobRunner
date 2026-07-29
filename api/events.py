@@ -1,0 +1,1 @@
+"""SSE endpoint (GET /events)."""
