@@ -17,25 +17,42 @@ schema migration would be.
 Shared, not a one-off: scripts/smoke.py's demo user (Phase 2), seeded API
 keys at API startup (Phase 3), the pytest fixture user (Phase 4), and
 sql/seed.sql's demo data (Phase 5) all provision users through this one
-function rather than each growing its own copy.
+function rather than each growing its own copy. connection() below is the
+same story one level down: any of those call sites that just needs a single
+statement's worth of direct DB access uses it rather than hand-rolling its
+own connect/close.
 """
 
 import uuid
+from contextlib import asynccontextmanager
 
 import asyncpg
+
+
+@asynccontextmanager
+async def connection(dsn: str):
+    """One-shot asyncpg connection: connect, yield, always close.
+
+    Not a pool — every current and planned caller (this module, and
+    scripts/smoke.py's cleanup) runs once per invocation, not in a hot
+    path, so a pool would be machinery none of them need. Extracted here
+    specifically because ensure_user was the first of at least three
+    planned copies of this exact connect/try/finally shape (Phase 3, Phase
+    4) — worth sharing now rather than letting a third copy accrete.
+    """
+    conn = await asyncpg.connect(dsn)
+    try:
+        yield conn
+    finally:
+        await conn.close()
 
 
 async def ensure_user(dsn: str, name: str, api_key: str) -> uuid.UUID:
     """Idempotent: creates the user if api_key is new, returns its id
     either way. A single INSERT ... ON CONFLICT DO UPDATE ... RETURNING is
     atomic — there's no separate check-then-insert here to lose a race on.
-
-    Opens and closes its own connection rather than a pool: this runs once
-    per invocation (script startup, API startup, test fixture setup), not
-    in a hot path — a pool would be machinery this doesn't need.
     """
-    conn = await asyncpg.connect(dsn)
-    try:
+    async with connection(dsn) as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO users (name, api_key)
@@ -47,5 +64,3 @@ async def ensure_user(dsn: str, name: str, api_key: str) -> uuid.UUID:
             api_key,
         )
         return row["id"]
-    finally:
-        await conn.close()

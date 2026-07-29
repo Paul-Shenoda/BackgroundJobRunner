@@ -7,12 +7,13 @@ real modules — store, handles, registry, events, runner, engine, the mock
 worker — run together against a real database rather than fakes.
 
 Boundary note: this script talks to Engine and nothing else in engine/, with
-one deliberate exception — user provisioning (scripts/bootstrap.py) is
-setup, not orchestration, and lives outside the engine on purpose (see that
-module's docstring). Task-row cleanup at the end of this script uses asyncpg
-directly for the same reason: it isn't engine business logic, just this
-script tidying up after itself, and CLAUDE.md's asyncpg-confinement rule
-scopes to engine/, not the whole repo.
+one deliberate exception — user provisioning and one-shot DB access
+(scripts/bootstrap.py's ensure_user/connection) are setup, not orchestration,
+and live outside the engine on purpose (see that module's docstring).
+Task-row cleanup at the end of this script uses that same shared connection()
+helper for the same reason: it isn't engine business logic, just this script
+tidying up after itself, and CLAUDE.md's asyncpg-confinement rule scopes to
+engine/, not the whole repo.
 
 Run as:
     python -m scripts.smoke [--keep]
@@ -28,15 +29,13 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
 
-import asyncpg
 from dotenv import load_dotenv
 
 from engine.engine import Engine
 from engine.models import Status
 from engine.workers.mock import mock_worker
-from scripts.bootstrap import ensure_user
+from scripts.bootstrap import connection, ensure_user
 
 DEMO_USER_NAME = "Smoke Test"
 DEMO_USER_API_KEY = "smoke-test-key"
@@ -87,15 +86,23 @@ async def cancel_and_confirm(engine, user_id, task, timeout=10.0):
     return await wait_for_task(engine, user_id, task.handle, task.id, {Status.CANCELLED}, timeout=timeout)
 
 
-async def print_events(queue, event_log):
+async def print_events(queue, event_log, start_time):
     """Background printer: logs every LifecycleEvent as it arrives, with a
     timestamp, and appends it to event_log so scenarios can assert on
-    exactly what a real SSE client would have seen."""
+    exactly what a real SSE client would have seen.
+
+    Timestamps are elapsed time since the script started (time.monotonic()
+    based), not wall-clock time. time.monotonic() is guaranteed
+    non-decreasing regardless of system clock adjustments — wall-clock
+    datetime.now() is not, and WSL2 in particular is known to apply
+    occasional backward clock corrections. A screen-recorded diagnostic
+    script should never print a timestamp that appears to go backward.
+    """
     while True:
         event = await queue.get()
         event_log.append(event)
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-        print(f"    [{ts}] EVENT {event.to_dict()}")
+        elapsed = time.monotonic() - start_time
+        print(f"    [+{elapsed:7.3f}s] EVENT {event.to_dict()}")
 
 
 # --- Scenarios ---------------------------------------------------------
@@ -110,7 +117,7 @@ async def print_events(queue, event_log):
 # handle number that an earlier scenario is still in the middle of
 # resolving.
 
-async def scenario_a(engine, user_id, track, event_log):
+async def scenario_a(engine, user_id, track, event_log, dsn):
     start = time.monotonic()
     task = await engine.submit(user_id, "scrape", {"duration_ms": 10000})
     elapsed = time.monotonic() - start
@@ -126,7 +133,7 @@ async def scenario_a(engine, user_id, track, event_log):
     await cancel_and_confirm(engine, user_id, task)
 
 
-async def scenario_b(engine, user_id, track, event_log):
+async def scenario_b(engine, user_id, track, event_log, dsn):
     scrape_task = await engine.submit(user_id, "scrape", {"duration_ms": 5000})
     report_task = await engine.submit(user_id, "report", {"duration_ms": 5000})
     track(scrape_task)
@@ -143,7 +150,7 @@ async def scenario_b(engine, user_id, track, event_log):
     await cancel_and_confirm(engine, user_id, report_task)
 
 
-async def scenario_c(engine, user_id, track, event_log):
+async def scenario_c(engine, user_id, track, event_log, dsn):
     tasks = [track(await engine.submit(user_id, "scrape", {"duration_ms": 3000})) for _ in range(5)]
 
     max_running = 0
@@ -165,7 +172,7 @@ async def scenario_c(engine, user_id, track, event_log):
         await wait_for_task(engine, user_id, t.handle, t.id, {Status.READY, Status.FAILED}, timeout=10)
 
 
-async def scenario_d(engine, user_id, track, event_log):
+async def scenario_d(engine, user_id, track, event_log, dsn):
     task = await engine.submit(user_id, "scrape", {"duration_ms": 30000})
     track(task)
     await wait_for_task(engine, user_id, task.handle, task.id, {Status.RUNNING}, timeout=10)
@@ -192,7 +199,7 @@ async def scenario_d(engine, user_id, track, event_log):
     print(f"  {task.handle} cancelled mid-run; no late 'ready' event after a 4s grace period")
 
 
-async def scenario_e(engine, user_id, track, event_log):
+async def scenario_e(engine, user_id, track, event_log, dsn):
     filler_a = track(await engine.submit(user_id, "scrape", {"duration_ms": 20000}))
     filler_b = track(await engine.submit(user_id, "scrape", {"duration_ms": 20000}))
     await wait_for_task(engine, user_id, filler_a.handle, filler_a.id, {Status.RUNNING}, timeout=10)
@@ -217,7 +224,7 @@ async def scenario_e(engine, user_id, track, event_log):
     await cancel_and_confirm(engine, user_id, filler_b)
 
 
-async def scenario_f(engine, user_id, track, event_log):
+async def scenario_f(engine, user_id, track, event_log, dsn):
     task = await engine.submit(user_id, "scrape", {"fail": True, "duration_ms": 500})
     track(task)
 
@@ -231,7 +238,7 @@ async def scenario_f(engine, user_id, track, event_log):
     print(f"  {task.handle} failed after {final.attempts} attempts: {final.error.reason!r}; exactly 1 'failed' event")
 
 
-async def scenario_g(engine, user_id, track, event_log):
+async def scenario_g(engine, user_id, track, event_log, dsn):
     task = await engine.submit(user_id, "scrape", {"fail_permanent": True, "duration_ms": 300})
     track(task)
 
@@ -241,7 +248,7 @@ async def scenario_g(engine, user_id, track, event_log):
     print(f"  {task.handle} failed permanently after 1 attempt: {final.error.reason!r}")
 
 
-async def scenario_h(engine, user_id, track, event_log):
+async def scenario_h(engine, user_id, track, event_log, dsn):
     # Part 1: ready -> collect -> the freed number gets reused.
     task = await engine.submit(user_id, "scrape", {"duration_ms": 500})
     track(task)
@@ -279,7 +286,7 @@ async def scenario_h(engine, user_id, track, event_log):
     await wait_for_task(engine, user_id, while_active.handle, while_active.id, {Status.READY, Status.FAILED}, timeout=10)
 
 
-async def scenario_i(engine, user_id, track, event_log):
+async def scenario_i(engine, user_id, track, event_log, dsn):
     task = await engine.submit(user_id, "scrape", {"fail_permanent": True, "duration_ms": 300})
     track(task)
     failed = await wait_for_task(engine, user_id, task.handle, task.id, {Status.FAILED}, timeout=10)
@@ -297,6 +304,72 @@ async def scenario_i(engine, user_id, track, event_log):
     await wait_for_task(engine, user_id, reused.handle, reused.id, {Status.READY, Status.FAILED}, timeout=10)
 
 
+async def scenario_j_poison_job(engine, user_id, track, event_log, dsn):
+    """Forces a lease to expire twice before any heartbeat can renew it,
+    proving reap_expired_leases's poison-job protection actually terminates
+    the task (both the requeue AND the exhaustion branch) instead of
+    cycling it forever. This was the exact gap code review caught — nothing
+    else in this script exercises the reap-to-failed path.
+
+    max_attempts=2 (not 1): with 1, the very first lease expiry is already
+    exhaustion, so the CASE WHEN's requeue branch never runs — the scenario
+    would still pass even if requeuing were completely broken. With 2, the
+    first expiry requeues (attempts=1<2) and the second exhausts
+    (attempts=2>=2), proving both branches in one run.
+
+    concurrency=2 (not 1) so the second reclaim doesn't have to wait for
+    the first attempt's worker to naturally finish before it can even be
+    claimed — keeps this fast (~3-4s) regardless of duration_ms.
+
+    duration_ms=10000 is deliberately far longer than this scenario's own
+    runtime, not arbitrary: heartbeat_interval=100 guarantees neither
+    attempt's worker ever notices its lease was reclaimed, so both keep
+    sleeping in the background the whole time. If either woke up and called
+    mark_ready while the row happened to be 'running' again (a fresh
+    claim), its stale WHERE status='running' could match and corrupt the
+    result. Making duration_ms far outlast the scenario means neither
+    worker wakes up during the test at all — the row's terminal 'failed'
+    state comes entirely from the reaper's own direct UPDATE, never from a
+    worker's outcome. Both orphaned workers get cleanly cancelled by
+    poison.stop() once the assertions are done.
+
+    claim_next has no per-pool scoping (see DECISIONS.md) — it claims the
+    oldest eligible 'queued' row globally, regardless of which WorkerPool
+    asks. Running this second, temporary pool concurrently with the main
+    one would risk each claiming the other's in-flight work, so the main
+    pool is stopped for the duration of this scenario and restarted after.
+    """
+    await engine.stop()
+    try:
+        poison = Engine(dsn=dsn, concurrency=2, lease_seconds=1,
+                         heartbeat_interval=100, max_attempts=2)
+        poison.register_worker("scrape", mock_worker)
+        await poison.start()
+        try:
+            task = await poison.submit(user_id, "scrape", {"duration_ms": 10000})
+            track(task)
+            final = await wait_for_task(poison, user_id, task.handle, task.id,
+                                         {Status.FAILED}, timeout=15)
+            assert final.attempts == 2, f"expected 2 attempts (max_attempts=2), got {final.attempts}"
+            assert final.error is not None and final.error.retryable is False
+            # Distinguishing check: this reason must come from the reap
+            # path, never a worker-reported one — no ordinary WorkerResult
+            # error (e.g. mock_worker's "upstream connection reset" or
+            # "unsupported input format: expected JSON") ever starts with
+            # "worker died mid-execution".
+            assert final.error.reason.startswith("worker died mid-execution"), (
+                f"expected the reap path's distinct reason (never a worker-reported "
+                f"one), got: {final.error.reason!r}"
+            )
+            assert "attempt 2 of 2" in final.error.reason and "exhausted" in final.error.reason
+            print(f"  {task.handle} poison-job protection: requeued once, then "
+                  f"exhausted and failed, reason={final.error.reason!r}")
+        finally:
+            await poison.stop()
+    finally:
+        await engine.start()
+
+
 SCENARIOS = [
     ("A. INSTANT HANDLE", scenario_a),
     ("B. PER-LANE NUMBERING", scenario_b),
@@ -307,23 +380,21 @@ SCENARIOS = [
     ("G. PERMANENT FAILURE", scenario_g),
     ("H. RECYCLING", scenario_h),
     ("I. COLLECT A FAILURE", scenario_i),
+    ("J. POISON-JOB PROTECTION", scenario_j_poison_job),
 ]
 
 
 async def cleanup(dsn, task_ids):
     """Delete exactly the rows this run created, by explicit id list, so
     the script is re-runnable without accumulating rows across recordings.
-    Direct asyncpg, same reasoning as scripts/bootstrap.py: this is script
-    housekeeping, not engine business logic, and CLAUDE.md's
-    asyncpg-confinement rule scopes to engine/, not the whole repo.
+    Uses the shared connection() helper — this is script housekeeping, not
+    engine business logic, and CLAUDE.md's asyncpg-confinement rule scopes
+    to engine/, not the whole repo.
     """
     if not task_ids:
         return
-    conn = await asyncpg.connect(dsn)
-    try:
+    async with connection(dsn) as conn:
         await conn.execute("DELETE FROM tasks WHERE id = ANY($1::uuid[])", task_ids)
-    finally:
-        await conn.close()
 
 
 async def main() -> int:
@@ -354,7 +425,8 @@ async def main() -> int:
 
     event_log = []
     queue = engine.subscribe(user_id)
-    printer = asyncio.create_task(print_events(queue, event_log))
+    start_time = time.monotonic()
+    printer = asyncio.create_task(print_events(queue, event_log, start_time))
 
     created_task_ids = []
 
@@ -367,7 +439,7 @@ async def main() -> int:
         for name, scenario in SCENARIOS:
             print(f"\n{'=' * 72}\nSCENARIO {name}\n{'=' * 72}")
             try:
-                await scenario(engine, user_id, track, event_log)
+                await scenario(engine, user_id, track, event_log, dsn)
             except Exception as e:  # noqa: BLE001 - a scenario failing must not abort the rest
                 results.append((name, False, str(e)))
                 print(f"  RESULT: FAIL — {e}")

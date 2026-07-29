@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from engine.events import EventBus, LifecycleEvent
-from engine.models import Job, Task, TaskError, WorkerResult
+from engine.models import Job, Status, Task, TaskError, WorkerResult
 from engine.registry import Worker, WorkerRegistry
 from engine.store import Store
 
@@ -45,15 +45,11 @@ class WorkerPool:
         self._concurrency = concurrency
         self._lease_seconds = lease_seconds
         self._heartbeat_interval = heartbeat_interval
-        # task.max_attempts (the per-row DB column) stays authoritative for
-        # the retry-exhaustion check in _execute_job — that's read off the
-        # claimed row, not from here. This value is the pool-level DEFAULT
-        # that gets written into new rows at submission time: engine.py's
-        # submit() reads pool.max_attempts and passes it down through
-        # handles.allocate() to store.insert_task when a task is created.
-        # That wiring lives in engine.py (module 7), not here — this
-        # constructor just holds the config value.
-        self._max_attempts = max_attempts
+        # max_attempts is accepted for signature completeness (matches the
+        # originally-specified constructor) but deliberately not stored:
+        # task.max_attempts (the per-row DB column, set at submission time
+        # by engine.py) is what _record_outcome actually checks, and
+        # nothing in this class ever reads a pool-level copy.
         self._poll_interval = poll_interval
         self._worker_id = str(uuid.uuid4())
 
@@ -74,11 +70,16 @@ class WorkerPool:
         """
         recovered = await self._store.reap_expired_leases()
         if recovered:
+            failed = [t for t in recovered if t.status == Status.FAILED]
             logger.info(
-                "startup recovery: reclaimed %d expired lease(s): %s",
+                "startup recovery: reclaimed %d expired lease(s) "
+                "(%d requeued, %d exhausted -> failed): %s",
                 len(recovered),
-                recovered,
+                len(recovered) - len(failed),
+                len(failed),
+                [t.handle for t in recovered],
             )
+            self._publish_reap_failures(recovered)
         self._shutdown.clear()
         self._dispatch_task = asyncio.create_task(self._dispatch_loop())
         self._reaper_task = asyncio.create_task(self._reaper_loop())
@@ -114,6 +115,13 @@ class WorkerPool:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+        # Explicit, not relied-upon-by-inference: every job_task's
+        # done-callback (_on_job_done) already pops its own entry, and
+        # asyncio's callback-ordering guarantee means that's already
+        # happened by the time gather() above returns. Clearing here turns
+        # that implementation detail into an enforced invariant instead of
+        # an assumption a future refactor could quietly break.
+        self._running.clear()
         self._dispatch_task = None
         self._reaper_task = None
 
@@ -180,8 +188,22 @@ class WorkerPool:
         Calling .exception() on a cancelled task is unsafe — it re-raises
         CancelledError — so that case is checked and skipped first.
         Cancellation is an expected, already-handled outcome, not a crash.
+
+        The pop is identity-checked, not unconditional: if the reaper
+        reclaims this task's lease while its worker is genuinely still
+        running (heartbeat trouble, or just slow to notice), the row can go
+        back to 'queued' and get re-claimed by _dispatch_loop before this
+        (the ORIGINAL) job finishes — which overwrites self._running[task_id]
+        with the NEW job_task. When the original then finally completes and
+        this callback fires, popping unconditionally would remove the NEW
+        job's entry, not the (already-gone) original's — silently
+        orphaning a task that is, in fact, still actively running from
+        self._running's bookkeeping. Comparing identity before popping
+        means this callback only ever removes the entry it actually put
+        there.
         """
-        self._running.pop(task_id, None)
+        if self._running.get(task_id) is job_task:
+            self._running.pop(task_id, None)
         if job_task.cancelled():
             return
         exc = job_task.exception()
@@ -268,16 +290,39 @@ class WorkerPool:
         to finish into. Cancel it and stop; _execute_job's `await
         worker_task` will raise CancelledError and take the
         record-nothing/publish-nothing path.
+
+        Any OTHER exception here (e.g. a transient DB error on the
+        heartbeat call itself) gets the same treatment, not just a log: we
+        can no longer vouch for owning the lease either way, so cancelling
+        the worker is the correct response to "heartbeat trouble", not only
+        to "heartbeat explicitly says we lost it". Without this, an
+        unguarded exception would kill this loop silently — the worker
+        would keep running, unaware, while its lease quietly expired, and
+        the reaper could reclaim and re-dispatch the same task while the
+        original was still genuinely alive. No re-raise after cancelling:
+        the cancellation IS the fix, and _execute_job's own finally block
+        already awaits this task and would just log the same exception a
+        second time for no benefit.
         """
-        while True:
-            await asyncio.sleep(self._heartbeat_interval)
-            still_ours = await self._store.heartbeat(task_id, self._lease_seconds)
-            if not still_ours:
-                logger.warning(
-                    "lease no longer held for task_id=%s; cancelling worker", task_id
-                )
-                worker_task.cancel()
-                return
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval)
+                still_ours = await self._store.heartbeat(task_id, self._lease_seconds)
+                if not still_ours:
+                    logger.warning(
+                        "lease no longer held for task_id=%s; cancelling worker", task_id
+                    )
+                    worker_task.cancel()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "heartbeat failed for task_id=%s; can no longer guarantee lease "
+                "ownership, cancelling worker",
+                task_id,
+            )
+            worker_task.cancel()
 
     async def _record_outcome(self, task: Task, result: WorkerResult) -> None:
         """Translate a terminal WorkerResult into store calls and lifecycle
@@ -398,11 +443,47 @@ class WorkerPool:
                 await asyncio.sleep(self._lease_seconds / 2)
                 recovered = await self._store.reap_expired_leases()
                 if recovered:
+                    failed = [t for t in recovered if t.status == Status.FAILED]
                     logger.info(
-                        "reaper: reclaimed %d expired lease(s): %s", len(recovered), recovered
+                        "reaper: reclaimed %d expired lease(s) "
+                        "(%d requeued, %d exhausted -> failed): %s",
+                        len(recovered),
+                        len(recovered) - len(failed),
+                        len(failed),
+                        [t.handle for t in recovered],
                     )
+                    for task in failed:
+                        logger.warning(
+                            "task %s exhausted its retry budget via repeated lease "
+                            "expiry (attempt %d of %d); marked failed",
+                            task.handle, task.attempts, task.max_attempts,
+                        )
+                    self._publish_reap_failures(recovered)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("reaper loop crashed; expired leases will no longer be reclaimed")
             raise
+
+    def _publish_reap_failures(self, recovered: list[Task]) -> None:
+        """Publish a 'failed' LifecycleEvent for every row reap_expired_leases
+        just terminated outright (attempts exhausted while its lease kept
+        expiring) — mirrors _record_outcome's publish for the WorkerResult
+        exhaustion path. Rows it merely requeued publish nothing, per
+        DECISIONS.md, "A retry emits no lifecycle event, whether automatic
+        or operator-triggered" — a reap-triggered requeue is exactly that
+        kind of automatic retry.
+        """
+        for task in recovered:
+            if task.status != Status.FAILED:
+                continue
+            assert task.error is not None  # set by reap_expired_leases's CASE branch
+            self._event_bus.publish(
+                LifecycleEvent.failed(
+                    user_id=task.user_id,
+                    handle=task.handle,
+                    lane=task.lane,
+                    reason=task.error.reason,
+                    retryable=False,
+                )
+            )

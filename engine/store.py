@@ -197,7 +197,11 @@ class Store:
         scrape-1 and immediately re-fetches it still sees it instead of a
         404. The boolean ORDER BY expression mirrors uniq_active_handle's
         predicate exactly — TRUE (active) sorts before FALSE, and at most
-        one row can ever be TRUE, so this is deterministic either way.
+        one row can ever be TRUE, so that part is deterministic either way.
+        The trailing `id DESC` is a separate concern: among two purely
+        historical rows (both FALSE), `created_at` alone doesn't guarantee
+        a strict order if two ever share an identical timestamp — `id` is
+        always unique, so it closes that low-probability gap.
         """
         row = await self._pool.fetchrow(
             """
@@ -206,7 +210,7 @@ class Store:
              ORDER BY (
                  status IN ('queued', 'running')
                  OR (status IN ('ready', 'failed') AND collected = false)
-             ) DESC, created_at DESC
+             ) DESC, created_at DESC, id DESC
              LIMIT 1
             """,
             user_id,
@@ -359,37 +363,84 @@ class Store:
         )
         return result == "UPDATE 1"
 
-    async def reap_expired_leases(self) -> list[str]:
-        """Requeue tasks whose lease expired without a heartbeat.
+    async def reap_expired_leases(self) -> list[Task]:
+        """Requeue tasks whose lease expired without a heartbeat — or, if
+        the task has now burned its whole attempt budget doing so, fail it
+        outright instead.
 
-        Returns the recovered handles so the caller can log what was
-        reclaimed. Deviates from the literal RETURNING handle shape to also
-        pull id/attempts, since recording a transition per row needs the
-        task's id, not just its handle.
+        Every claim increments attempts (see claim_next), including a claim
+        that never gets a heartbeat — see DECISIONS.md, "A crash-requeue
+        consumes an attempt" (poison-job protection). This method is the
+        ONLY place that decision is actually enforced on the reap path: a
+        task whose worker never returns a WorkerResult (crashed outright,
+        or hung and got cancelled by _heartbeat_loop) never reaches
+        runner.py's _record_outcome, which is the only other place attempts
+        is compared against max_attempts. Skipping the check here would let
+        such a task reclaim and requeue forever, attempts climbing
+        unbounded, never reaching a terminal state.
+
+        The attempts >= max_attempts comparison is embedded directly in the
+        UPDATE's CASE, not resolved via a separate SELECT-then-branch step,
+        so the exhausted case can transition RUNNING -> FAILED directly and
+        atomically — never surfacing a dishonest intermediate RUNNING ->
+        QUEUED. This is a deliberate, narrow exception to this module's
+        usual rule that retry-budget policy lives upstream (see module
+        docstring): runner.py only ever observes the row after this
+        statement has already committed, by which point a wrongly-taken
+        QUEUED transition could not be undone without a second, misleading
+        event.
+
+        The exhaustion reason is deliberately worded differently from a
+        worker-reported exhaustion reason (runner.py's _record_outcome):
+        "worker died mid-execution" is honest about what actually happened
+        here — the worker never returned anything, the lease just stopped
+        being renewed — versus a worker-reported reason like "upstream
+        connection reset", which describes the work itself failing. Same
+        exhaustion outcome, different honest cause (CLAUDE.md requires
+        distinct, honest reasons).
+
+        Returns the full recovered Task rows (not just handles), coerced
+        via _row_to_task, so the caller can tell the two outcomes apart via
+        .status and, for the failed ones, construct a 'failed'
+        LifecycleEvent — mirroring how _record_outcome does the same for
+        the WorkerResult exhaustion path.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     """
                     UPDATE tasks
-                       SET status = 'queued',
+                       SET status = (CASE WHEN attempts >= max_attempts
+                                           THEN 'failed' ELSE 'queued' END)::task_status,
                            worker_id = NULL,
                            lease_expires_at = NULL,
+                           error = CASE WHEN attempts >= max_attempts THEN
+                                       jsonb_build_object(
+                                           'reason',
+                                           'worker died mid-execution (attempt ' || attempts
+                                           || ' of ' || max_attempts || ', retries exhausted)',
+                                           'retryable', false
+                                       )
+                                   ELSE error END,
                            updated_at = now()
                      WHERE status = 'running' AND lease_expires_at < now()
-                    RETURNING id, handle, attempts
+                    RETURNING *
                     """
                 )
-                for row in rows:
-                    await _record_transition(
-                        conn,
-                        row["id"],
-                        Status.RUNNING,
-                        Status.QUEUED,
-                        "lease expired; reclaimed by reaper",
-                        row["attempts"],
-                    )
-                return [row["handle"] for row in rows]
+                recovered = [_row_to_task(row) for row in rows]
+                for task in recovered:
+                    if task.status == Status.FAILED:
+                        assert task.error is not None  # set by the CASE branch above
+                        await _record_transition(
+                            conn, task.id, Status.RUNNING, Status.FAILED,
+                            task.error.reason, task.attempts,
+                        )
+                    else:
+                        await _record_transition(
+                            conn, task.id, Status.RUNNING, Status.QUEUED,
+                            "lease expired; reclaimed by reaper", task.attempts,
+                        )
+                return recovered
 
     async def mark_ready(self, task_id: uuid.UUID, result: Any) -> Task | None:
         """Conditional: only succeeds from 'running'. Returns None if the
