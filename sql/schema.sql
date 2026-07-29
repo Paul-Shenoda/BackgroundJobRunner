@@ -34,7 +34,15 @@ CREATE TABLE tasks (
     seeded            BOOLEAN NOT NULL DEFAULT false,  -- demo data, clearly flagged
 
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Monotonic insertion order, independent of the wall clock. created_at
+    -- remains the user-facing timestamp in the API contract; seq exists
+    -- purely so get_task's historical-row tie-break has something to sort
+    -- by that a clock jump (NTP correction, VM suspend/resume, container
+    -- migration) can't put out of causal order. See DECISIONS.md, "handle
+    -- resolution ordering uses a monotonic sequence, not a timestamp".
+    seq               BIGSERIAL
 );
 
 -- THE load-bearing invariant: a handle can never collide with an active one.

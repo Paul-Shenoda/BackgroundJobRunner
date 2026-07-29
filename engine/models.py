@@ -78,6 +78,7 @@ class Task:
     seeded: bool
     created_at: datetime
     updated_at: datetime
+    seq: int  # monotonic insertion order (BIGSERIAL); internal, never in to_api_dict()
 
     def to_api_dict(self) -> dict[str, Any]:
         """Serialise to exactly the nine fields fixed by the API contract.

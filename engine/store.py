@@ -65,6 +65,7 @@ def _row_to_task(row: asyncpg.Record) -> Task:
         seeded=row["seeded"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        seq=row["seq"],
     )
 
 
@@ -197,11 +198,23 @@ class Store:
         scrape-1 and immediately re-fetches it still sees it instead of a
         404. The boolean ORDER BY expression mirrors uniq_active_handle's
         predicate exactly — TRUE (active) sorts before FALSE, and at most
-        one row can ever be TRUE, so that part is deterministic either way.
-        The trailing `id DESC` is a separate concern: among two purely
-        historical rows (both FALSE), `created_at` alone doesn't guarantee
-        a strict order if two ever share an identical timestamp — `id` is
-        always unique, so it closes that low-probability gap.
+        one row can ever be TRUE, so that part is deterministic no matter
+        what.
+
+        The historical-fallback tie-break is `seq DESC`, not `created_at
+        DESC` — this used to be created_at, and a live run caught the gap:
+        a system clock jump (NTP correction, VM suspend/resume, container
+        migration) can make Postgres's own now() briefly disagree with true
+        insertion order, so two historical rows' created_at values can come
+        back in the wrong order even though nothing about the query logic
+        is wrong. seq (BIGSERIAL) is assigned by a database sequence, not
+        the wall clock, so it's monotonic by construction regardless of
+        what the system clock does — and since it's a sequence, it's also
+        always unique, so no further tie-break is needed after it. See
+        DECISIONS.md, "handle resolution ordering uses a monotonic
+        sequence, not a timestamp". created_at remains the user-facing
+        timestamp in the API contract; it's just no longer load-bearing for
+        this correctness question.
         """
         row = await self._pool.fetchrow(
             """
@@ -210,7 +223,7 @@ class Store:
              ORDER BY (
                  status IN ('queued', 'running')
                  OR (status IN ('ready', 'failed') AND collected = false)
-             ) DESC, created_at DESC, id DESC
+             ) DESC, seq DESC
              LIMIT 1
             """,
             user_id,

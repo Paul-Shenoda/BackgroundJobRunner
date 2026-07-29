@@ -144,6 +144,34 @@ The reaper runs on boot **and** on a timer — boot-only recovery would miss a w
 
 ## Setup & Running Locally
 
+### Database schema
+
+`sql/schema.sql` is the single source of truth for the database, applied by
+hand — there's no migration tooling and no `docker-entrypoint-initdb.d` init
+script wired into `docker-compose.yml` (see DECISIONS.md, "Raw SQL via
+asyncpg rather than an ORM": migrations were a deliberate non-goal for this
+proof of concept). After `docker compose up -d`, apply it once:
+
+```
+docker compose exec postgres psql -U jobrunner -d jobrunner -f - < sql/schema.sql
+```
+
+**If you already have a running database from before `tasks.seq` was added**
+(the monotonic ordering column — see DECISIONS.md, "Handle resolution
+ordering uses a monotonic sequence, not a timestamp"), a fresh `schema.sql`
+apply won't retroactively add it to an existing table. Run the one statement
+by hand instead:
+
+```
+docker compose exec postgres psql -U jobrunner -d jobrunner -c "ALTER TABLE tasks ADD COLUMN seq BIGSERIAL;"
+```
+
+Same end state either way — a fresh clone gets `seq` from `schema.sql`
+directly; an existing database gets there via this one `ALTER TABLE`. Worth
+keeping in mind if `schema.sql` picks up further changes later: without
+migration tooling, every existing database needs its own hand-applied catch-up
+statement, not just new ones.
+
 ### Known issues
 
 **Docker Desktop + WSL2: pulls fail with truncated layers.** Docker Desktop's containerd image store mishandles range-requested downloads over WSL2, causing `httpReadSeeker: failed open ... EOF` mid-pull. Affects both Windows 10 and 11. Fix: in Docker Desktop, **Settings → General**, disable **"Use containerd for pulling and storing images"**, then Apply & Restart.

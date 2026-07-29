@@ -40,6 +40,50 @@ from scripts.bootstrap import connection, ensure_user
 DEMO_USER_NAME = "Smoke Test"
 DEMO_USER_API_KEY = "smoke-test-key"
 
+event_logger = logging.getLogger("scripts.smoke.events")
+
+
+class ElapsedTimeFilter(logging.Filter):
+    """Injects record.elapsed = seconds since script start, computed via
+    time.monotonic() at the moment each record is emitted.
+
+    Not derived from the record's own timestamp: logging.LogRecord.created
+    is wall-clock (time.time())-based, so subtracting a wall-clock start
+    reference wouldn't actually restore monotonicity if a clock jump
+    happened mid-run — the subtraction would just carry the jump's error
+    into the result. Calling time.monotonic() fresh here, at emit time, is
+    what makes this genuinely immune to it, the same guarantee print_events
+    already relies on for the event stream.
+    """
+
+    def __init__(self, start_time: float) -> None:
+        super().__init__()
+        self._start_time = start_time
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.elapsed = time.monotonic() - self._start_time
+        return True
+
+
+def configure_logging(start_time: float) -> None:
+    """One destination (stdout), one format, one clock basis for
+    everything this script emits while running: runner.py's background-task
+    logs (dispatch/reaper/heartbeat) AND the lifecycle event stream (via
+    print_events using event_logger below), instead of two independent
+    streams — print() to stdout with UTC wall-clock, logging to stderr with
+    local wall-clock. Independently harmless, but interleaved output from
+    two unsynchronized clocks and two different destinations reads as a
+    defect to anyone watching a recording, even when nothing is actually
+    wrong. Elapsed monotonic time instead of UTC for the same reason
+    DECISIONS.md's "handle resolution ordering uses a monotonic sequence,
+    not a timestamp" entry gives: wall-clock time, UTC or not, is exactly
+    what a WSL2 clock jump can corrupt — monotonic elapsed time can't be.
+    """
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.addFilter(ElapsedTimeFilter(start_time))
+    handler.setFormatter(logging.Formatter("[+%(elapsed)7.3fs] %(levelname)-7s %(name)s: %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
 
 async def wait_for_task(engine, user_id, handle, task_id, statuses, timeout=15.0, interval=0.25):
     """Poll GET /tasks/{handle} until the row matching task_id reaches one
@@ -86,23 +130,21 @@ async def cancel_and_confirm(engine, user_id, task, timeout=10.0):
     return await wait_for_task(engine, user_id, task.handle, task.id, {Status.CANCELLED}, timeout=timeout)
 
 
-async def print_events(queue, event_log, start_time):
-    """Background printer: logs every LifecycleEvent as it arrives, with a
-    timestamp, and appends it to event_log so scenarios can assert on
-    exactly what a real SSE client would have seen.
+async def print_events(queue, event_log):
+    """Background printer: logs every LifecycleEvent as it arrives, and
+    appends it to event_log so scenarios can assert on exactly what a real
+    SSE client would have seen.
 
-    Timestamps are elapsed time since the script started (time.monotonic()
-    based), not wall-clock time. time.monotonic() is guaranteed
-    non-decreasing regardless of system clock adjustments — wall-clock
-    datetime.now() is not, and WSL2 in particular is known to apply
-    occasional backward clock corrections. A screen-recorded diagnostic
-    script should never print a timestamp that appears to go backward.
+    Goes through event_logger (see configure_logging) rather than a bare
+    print() — same handler, same format, same monotonic-elapsed clock
+    basis as runner.py's own background-task logs, so this and the
+    dispatch/reaper/heartbeat logs interleave as one coherent stream
+    instead of two that visually disagree.
     """
     while True:
         event = await queue.get()
         event_log.append(event)
-        elapsed = time.monotonic() - start_time
-        print(f"    [+{elapsed:7.3f}s] EVENT {event.to_dict()}")
+        event_logger.info("EVENT %s", event.to_dict())
 
 
 # --- Scenarios ---------------------------------------------------------
@@ -402,11 +444,17 @@ async def main() -> int:
     parser.add_argument("--keep", action="store_true", help="skip cleanup; leave created rows in place for inspection")
     args = parser.parse_args()
 
+    # Captured before configure_logging (and before anything else that
+    # might log) so every timestamp this run ever prints — engine logs and
+    # events alike — measures from the exact same zero point.
+    start_time = time.monotonic()
+
     # Without this, background-task exceptions in runner.py (dispatch loop,
     # reaper loop, per-job execution) log through Python's silent default
     # "last resort" handler, which is easy to miss. Explicit config makes
-    # the engine's internal state loud in a script meant to be watched.
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # the engine's internal state loud in a script meant to be watched, and
+    # unifies it with the event stream's own logging (see print_events).
+    configure_logging(start_time)
 
     load_dotenv()
     dsn = os.environ.get("DATABASE_URL")
@@ -425,8 +473,7 @@ async def main() -> int:
 
     event_log = []
     queue = engine.subscribe(user_id)
-    start_time = time.monotonic()
-    printer = asyncio.create_task(print_events(queue, event_log, start_time))
+    printer = asyncio.create_task(print_events(queue, event_log))
 
     created_task_ids = []
 
