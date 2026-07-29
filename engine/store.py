@@ -132,9 +132,16 @@ class Store:
         lane: str,
         number: int,
         params: dict,
+        max_attempts: int = 3,
         seeded: bool = False,
     ) -> Task:
         """INSERT ... RETURNING *, plus the NULL -> queued creation event.
+
+        max_attempts defaults to 3, matching sql/schema.sql's column
+        default, so a direct caller that doesn't care still gets the same
+        behaviour as before this parameter existed. engine.submit() passes
+        its configured pool-level default explicitly rather than relying
+        on this fallback (see engine.py).
 
         Raises HandleConflict (not asyncpg.UniqueViolationError) when the
         (user_id, lane, number) is already held by another row — the
@@ -152,14 +159,15 @@ class Store:
                 try:
                     row = await conn.fetchrow(
                         """
-                        INSERT INTO tasks (user_id, lane, number, params, seeded)
-                        VALUES ($1, $2, $3, $4, $5)
+                        INSERT INTO tasks (user_id, lane, number, params, max_attempts, seeded)
+                        VALUES ($1, $2, $3, $4, $5, $6)
                         RETURNING *
                         """,
                         user_id,
                         lane,
                         number,
                         params,
+                        max_attempts,
                         seeded,
                     )
                 except asyncpg.UniqueViolationError as e:
@@ -173,8 +181,34 @@ class Store:
                 return task
 
     async def get_task(self, user_id: uuid.UUID, handle: str) -> Task | None:
+        """A handle string is not unique across all time — recycling means
+        an old, terminal row and a new, active row can share the same
+        (user_id, lane, number) once the old one is collected or
+        cancelled. Without disambiguation this query is genuinely
+        ambiguous whenever that happens: uniq_active_handle guarantees at
+        most ONE row can ever be active for a given handle, but says
+        nothing about how many terminal rows accumulate under it over
+        time, and a plain WHERE with no ORDER BY returns Postgres's scan
+        order, not any meaningful one.
+
+        Resolution order: the active row wins if one exists (a handle
+        names a currently-active task first and foremost); otherwise the
+        most recent historical row, so a client that just collected
+        scrape-1 and immediately re-fetches it still sees it instead of a
+        404. The boolean ORDER BY expression mirrors uniq_active_handle's
+        predicate exactly — TRUE (active) sorts before FALSE, and at most
+        one row can ever be TRUE, so this is deterministic either way.
+        """
         row = await self._pool.fetchrow(
-            "SELECT * FROM tasks WHERE user_id = $1 AND handle = $2",
+            """
+            SELECT * FROM tasks
+             WHERE user_id = $1 AND handle = $2
+             ORDER BY (
+                 status IN ('queued', 'running')
+                 OR (status IN ('ready', 'failed') AND collected = false)
+             ) DESC, created_at DESC
+             LIMIT 1
+            """,
             user_id,
             handle,
         )
@@ -282,7 +316,7 @@ class Store:
                     UPDATE tasks
                        SET status = 'running',
                            worker_id = $1,
-                           lease_expires_at = now() + ($2 || ' seconds')::interval,
+                           lease_expires_at = now() + make_interval(secs => $2),
                            attempts = attempts + 1,
                            updated_at = now()
                      WHERE id = (
@@ -317,7 +351,7 @@ class Store:
         result = await self._pool.execute(
             """
             UPDATE tasks
-               SET lease_expires_at = now() + ($2 || ' seconds')::interval
+               SET lease_expires_at = now() + make_interval(secs => $2)
              WHERE id = $1 AND status = 'running'
             """,
             task_id,
@@ -456,6 +490,15 @@ class Store:
         isn't a fixed constant here, so it's captured via SELECT ... FOR
         UPDATE before the UPDATE, with the row lock held across both
         statements to keep the read-then-write atomic.
+
+        Unambiguous by construction, unlike get_task: `status IN
+        ('queued', 'running')` is a strict subset of uniq_active_handle's
+        predicate, and that index guarantees at most one row per
+        (user_id, lane, number) can ever satisfy it. A handle recycled
+        many times over can accumulate any number of terminal rows, but
+        this WHERE clause can only ever match the current active one (or
+        nothing) — never a historical row, and never more than one match.
+        No ORDER BY/LIMIT needed to make this safe; the index already did.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -498,6 +541,12 @@ class Store:
 
         No transition recorded: collected is a flag, not a status (per
         CLAUDE.md), so there's nothing for task_events to capture here.
+
+        Unambiguous by construction: `status IN ('ready', 'failed') AND
+        collected = false` is exactly uniq_active_handle's second branch,
+        so it can match at most one row — the active one — no matter how
+        many already-collected historical rows share this handle from
+        past cycles. No ORDER BY/LIMIT needed.
         """
         row = await self._pool.fetchrow(
             """
@@ -518,7 +567,21 @@ class Store:
         clears error, resets attempts to 0, clears not_before. Distinct from
         requeue_for_retry (the automatic engine-driven retry): this is a
         fresh attempt budget authorized by a human, not another try against
-        the same one."""
+        the same one.
+
+        WHERE clause bug fixed here: `status = 'failed'` alone is NOT a
+        subset of uniq_active_handle's predicate — it also matches
+        already-collected historical rows, which the index does not keep
+        unique (collected = true falls outside it entirely). A handle
+        retried after being collected and reused could therefore have
+        matched an old, dead 'failed' row instead of (or ambiguously
+        alongside) the live one. Adding `AND collected = false` makes this
+        exactly the index's second branch, restoring the same
+        at-most-one-row guarantee collect_result already relies on.
+        Retrying a collected historical row would be nonsense — collected
+        is supposed to be a one-way flag, not something a retry silently
+        reopens.
+        """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -529,7 +592,8 @@ class Store:
                            attempts = 0,
                            not_before = NULL,
                            updated_at = now()
-                     WHERE user_id = $1 AND handle = $2 AND status = 'failed'
+                     WHERE user_id = $1 AND handle = $2
+                       AND status = 'failed' AND collected = false
                     RETURNING *
                     """,
                     user_id,

@@ -31,6 +31,98 @@
 
 ## Decision log
 
+### [2026-07-29] — A handle identifies the active task, with fallback to most recent history
+- **Context:** Discovered via scripts/smoke.py's first real run against Postgres — the first time store.py's SQL executed against a live database rather than a fake. Handle recycling means a handle string like `scrape-1` is not unique across time: once a task is collected or cancelled, its number can be reused by a new submission, leaving an old terminal row and a new active row that share the same `(user_id, lane, number)`. `get_task`'s query had no `ORDER BY`, so with two matching rows Postgres returned whichever its scan happened to find first — observed in practice as consistently the OLDER row (sequential scan order tends to favor earlier-inserted tuples). `GET /tasks/scrape-1` could silently return a stale collected/cancelled row while the real, live `scrape-1` was running or ready — a genuine defect sitting directly on criterion 4 (handle recycling), not a smoke-test artifact. The same audit found `reset_for_retry`'s `WHERE status = 'failed'` had the identical exposure: missing `AND collected = false`, so an operator retry could silently match an old collected 'failed' row instead of the live one.
+- **Options considered:** (A) Make handle lookups 404 the instant a handle is reused elsewhere (reject ambiguity entirely). (B) Resolve to the active row if one exists, falling back to the most recent historical row otherwise. (C) Leave read paths ambiguous and only fix the mutating methods (which are already unambiguous by construction — see below).
+- **Chose:** B, for `get_task` (the only method that needs a fallback). The mutating methods (`collect_result`, `cancel_task`, `reset_for_retry`) don't get a fallback — they must return `None` when there's no active row, never fall back to touching history.
+- **Why:** A handle names a currently-active task first and foremost, so while one exists it must win unambiguously — that's B and C's shared premise. But a client that just collected `scrape-1` and immediately re-fetches it (a completely normal UI flow — confirm-then-refresh) should still see that task, not a 404 (rules out A) and not silence (rules out doing nothing). Falling back to the most recent historical row keeps that working while never letting a stale row outrank a live one. The ordering expression (`(status IN ('queued','running') OR (status IN ('ready','failed') AND collected=false)) DESC, created_at DESC`) is deterministic precisely because `uniq_active_handle` guarantees at most one row can ever evaluate the first clause `TRUE` — there's no scenario where two rows both claim to be "the active one."
+
+  The mutating methods needed no such ordering trick, once actually audited: `cancel_task`'s `status IN ('queued','running')` and `collect_result`'s `status IN ('ready','failed') AND collected=false` are each already an exact subset of `uniq_active_handle`'s predicate, so the index itself guarantees at most one row can match — they were unambiguous by construction and needed no code change, only confirmation (now documented inline in each). `reset_for_retry` was the one exception: its `WHERE status = 'failed'` was missing `collected = false`, so it wasn't actually a subset of the active predicate — fixed by adding that clause, bringing it in line with the other two.
+- **Tradeoff / cost:** `get_task`'s query is now a three-way `ORDER BY` instead of a flat `WHERE`, and every handle-scoped read carries that cost — negligible at this table size, and the index that makes it correct is already required for handle allocation.
+- **Revisit if:** N/A — this is the correct permanent semantics for a recyclable-handle system, not a stopgap.
+
+### [2026-07-29] — `Engine.list()` renamed to `list_tasks()`: it collided with the builtin
+- **Context:** `Engine` defined a method named `list()`. Python class bodies execute as a namespace: once `list()` was defined, every subsequent statement in that class body — including type annotations evaluated at `def`-time, like `get_detail`'s `-> Optional[tuple[Task, list[TaskEvent]]]` — resolved `list` to that method object instead of the builtin, and crashed at class-definition time (`TypeError: 'function' object is not subscriptable`).
+- **Options considered:** Work around it with `from __future__ import annotations` alone (defers annotation evaluation to strings, so it no longer breaks) / rename the method.
+- **Chose:** Both — keep the `__future__` import as cheap insurance, but also rename `list()` to `list_tasks()`.
+- **Why:** The `__future__` import only fixes annotations. It does nothing about a plain `list(...)` call appearing later in the same class body (a default value, a class-level constant, a decorator argument) — that would still resolve to the method and fail or misbehave silently depending on arity. Renaming removes the collision at its source instead of papering over one symptom of it. It also now matches `store.list_tasks`, so the same operation has the same name at both layers.
+- **Tradeoff / cost:** None — `list_tasks` is arguably the better name anyway (`Engine.list` read ambiguously next to Python's own `list`).
+- **Revisit if:** N/A.
+
+### [2026-07-29] — No graceful-shutdown mode; the reaper is the only recovery path
+- **Context:** `WorkerPool.stop()` was initially specced with a `graceful` flag, without defining what the non-graceful branch would skip.
+- **Options considered:** Implement a real distinction (drain in-flight jobs vs abandon them) / keep the flag as a no-op / remove it.
+- **Chose:** Remove it. `stop()` takes no flag.
+- **Why:** Both branches would have done the same thing. Shutdown cancels in-flight asyncio tasks and leaves their rows `running` with live leases for the reaper to reclaim on next boot — there is no draining step for a "less graceful" mode to skip. More fundamentally, a SIGKILL runs no cleanup at all, so the reaper has to be correct without any shutdown hook. Once that's true, a shutdown handler is a second mechanism doing what the first already does. A parameter that doesn't change behaviour is worse than no parameter: it implies a distinction that doesn't exist.
+- **Tradeoff / cost:** After an unclean kill, orphaned rows stay `running` for up to `lease_seconds` before recovery. Accepted deliberately — see the at-least-once entry below.
+- **Revisit if:** Workers acquire external resources needing release on shutdown, at which point cleanup becomes the worker's responsibility, not the pool's.
+
+### [2026-07-29] — A retry emits no lifecycle event, whether automatic or operator-triggered
+- **Context:** When a retryable failure returns a job to `queued` for another attempt, should that publish to the event stream? The same question came up again for `Engine.retry()`, the operator-triggered path for a `failed` job — it was initially specced to publish `accepted`, on the reasoning that the job is "re-entering the system."
+- **Options considered:** Emit a `retrying` event / emit `failed` then `accepted` / emit `accepted` only for the operator-triggered path (treating it as distinct from an automatic requeue) / emit nothing in either case.
+- **Chose:** Emit nothing, for both the automatic requeue (`runner.py`) and the operator-triggered retry (`Engine.retry()`).
+- **Why:** The API contract fixes exactly four event types — `accepted`, `ready`, `failed`, `cancelled` — and none of them honestly describes "an existing task returned to `queued`." A `retrying` type would violate the contract. Emitting `failed` for a job about to run again would mislead a consumer treating `failed` as terminal. And `accepted` specifically means "a new row was created" — a client that treats `accepted` as "append a row" would duplicate an existing task on every operator retry, since the handle, params, and history are all unchanged from before. The retry is still fully visible: recorded in `task_events`, with `attempts` reset to 0 and visible on the dashboard row, and the task itself shows back up in a `GET /tasks?status=queued` refetch.
+- **Tradeoff / cost:** A client watching only the stream sees nothing when a retry happens, automatic or operator-triggered. Acceptable because the stream is a liveness hint, not the source of truth — a refetch shows current state either way.
+- **Revisit if:** The contract's event types were ever extensible — at which point a `requeued` type covering both cases would be the natural addition, not two different ad-hoc signals for the two retry paths.
+
+### [2026-07-29] — Unknown lanes are rejected at submission, not discovered at claim time
+- **Context:** Nothing initially prevented submitting a task for a lane with no registered worker. Such a task would be created, sit in `queued`, get claimed, and then have nowhere to go — a silently stuck job.
+- **Options considered:** Fail it at claim time / validate at submission via `registry.has(lane)`.
+- **Chose:** Validate at submission, and *also* fail defensively at claim time.
+- **Why:** A stuck job with no explanation is exactly the silent failure the brief's observability bar rules out. Rejecting at submission gives the caller an immediate, actionable error instead of a task that looks accepted and never moves. The claim-time check stays as a backstop for the case where a worker is unregistered after a task is already queued — it marks the task failed and non-retryable rather than leaving it `running` forever.
+- **Tradeoff / cost:** Lane validity is coupled to registry state at submission time.
+- **Revisit if:** Lanes ever need to be submittable before their workers are registered (e.g. deferred worker loading).
+
+### [2026-07-29] — Bounded subscriber queues; drop events rather than block
+- **Context:** The event bus fans out to one queue per subscriber. A slow or dead SSE client could otherwise grow its queue without limit or stall the publisher.
+- **Options considered:** Unbounded queues / bounded with blocking publish / bounded with drop-on-full.
+- **Chose:** Bounded (maxsize 100), dropping the event for any subscriber whose queue is full. `publish()` never blocks and never raises into its caller.
+- **Why:** The worker pool must never be stalled by a client that stopped reading — a failure to *notify* must not fail a job that actually *completed*. Dropping is safe precisely because of the liveness-hint decision below: clients refetch `GET /tasks` on reconnect, so a dropped event self-heals. Unbounded queues would turn a dead browser tab into a memory leak.
+- **Tradeoff / cost:** A very slow client can miss events. Recovered on its next refetch.
+- **Revisit if:** Events ever carry information not reconstructible from task state.
+
+### [2026-07-28] — `store.py` translates driver exceptions into domain exceptions
+- **Context:** `handles.py` needs to detect a lost allocation race, which surfaces as `asyncpg.UniqueViolationError`. Catching it there would put a database driver import in a module that is otherwise pure policy.
+- **Options considered:** Catch `UniqueViolationError` directly in `handles.py` (permitting one carve-out to the asyncpg rule) / have `store.py` catch it and re-raise a domain `HandleConflict`.
+- **Chose:** Translation in `store.py`.
+- **Why:** It preserves a claim that is checkable in one command — `grep -rl asyncpg engine/` returns exactly one file, with no exceptions to explain. Architecture claims are cheap; a falsifiable one that survives the check is worth far more. It's also better on the merits: translating a driver's vocabulary into the domain's is precisely what a data-access layer is for, and `store.py` already does the same for rows (raw record → `Task`). Leaving errors untranslated would be doing half the job.
+- **Tradeoff / cost:** One extra exception class and a try/except in `insert_task`.
+- **Revisit if:** N/A.
+- **Note:** This buys layer hygiene, not database portability. The claim query depends on `SKIP LOCKED` and allocation depends on partial indexes, so swapping storage engines would mean rewriting `store.py`'s logic, not just its connection string. The honest claim is "the blast radius of a storage change is one file," not "the engine is database-agnostic."
+
+### [2026-07-28] — `task_events` records creation, not just transitions
+- **Context:** `insert_task` initially wrote no `task_events` row, so a task's state history began at `queued → running` with no record of its own creation.
+- **Options considered:** Treat creation as not-a-transition / record it with `from_status = NULL`.
+- **Chose:** Record it.
+- **Why:** The brief requires the detail view to show "its state history with timestamps." A history missing its first entry is incomplete. `TaskEvent.from_status` is already `Optional[Status]` precisely so a null origin is representable.
+- **Tradeoff / cost:** One extra row per task.
+- **Revisit if:** N/A.
+
+### [2026-07-28] — `TaskEvent` (persisted history) vs `LifecycleEvent` (live stream)
+- **Context:** Two different concepts were converging on the same name: the `task_events` rows backing the detail view's state history, and the four-type notifications pushed to SSE clients.
+- **Options considered:** Reuse one type for both / name them distinctly.
+- **Chose:** `TaskEvent` for persisted state history, `LifecycleEvent` for stream notifications.
+- **Why:** They differ in shape, audience, and lifetime. History rows are internal, exhaustive, and permanent — including transitions like `running → queued` on retry that deliberately never reach the stream. Lifecycle events are external, limited to four contract-fixed types, and ephemeral. Collapsing them would have forced one of the two to carry fields it doesn't need, and made every later conversation about "events" ambiguous.
+- **Tradeoff / cost:** Two similar-sounding types to keep straight.
+- **Revisit if:** N/A.
+
+### [2026-07-28] — API serialisation derives `result`/`error` from `status` rather than trusting stored state
+- **Context:** The contract states `result` is populated only when status is `ready`, and `error` only when `failed`.
+- **Options considered:** Emit whatever the row holds / compute both from the current status at serialisation time.
+- **Chose:** Compute from status.
+- **Why:** It makes the contract hold structurally rather than by convention. Even if a bug left a stale `result` on a row that later failed, the serialised output stays conformant. The invariant is enforced at the single point where it's externally visible, rather than depending on every write path having cleaned up correctly.
+- **Tradeoff / cost:** None meaningful.
+- **Revisit if:** N/A.
+
+### [2026-07-28] — Codespaces devcontainer adds an app service, not just Postgres
+- **Context:** The initial scaffold could have extended the root compose file's Postgres service alone, leaving Codespaces with a database but no Python environment.
+- **Options considered:** Postgres-only devcontainer / add an app service extending the root compose file.
+- **Chose:** Add an app service (Python 3.12 image, repo mounted, waiting on the Postgres healthcheck).
+- **Why:** The brief requires the project to run in GitHub Codespaces. A bare Postgres container satisfies the letter of "bring up the database" while leaving nowhere to actually run the engine. Extending the root compose file rather than duplicating it keeps local WSL and Codespaces on one definition — two divergent environment setups is a failure that surfaces at the worst possible moment.
+- **Tradeoff / cost:** A second compose file to keep coherent, mitigated by `extends` rather than duplication.
+- **Revisit if:** N/A.
+
+
 ### [2026-07-28] — Event stream is a liveness hint, not a data channel
 - **Context:** If the SSE connection drops and a job completes during the gap, that `ready` event is delivered to nobody. The client reconnects successfully and looks healthy while displaying a job stuck at `running` forever — silently wrong state, which the brief's "no silent failures" bar rules out.
 - **Options considered:** (A) On every reconnect, refetch `GET /tasks` and replace client state wholesale. (B) Server-side replay buffer with sequence IDs and `Last-Event-ID` resumption.
@@ -154,6 +246,23 @@
 - **Revisit if:** N/A.
 
 ---
+
+---
+
+## Smaller implementation calls
+Real forks, resolved quickly — logged so they don't have to be re-reasoned later.
+
+- **`Status` as a `str` subclass enum** — serialises as a plain string with no custom JSON encoder, and `Status.QUEUED == "queued"` holds when comparing against values read back from Postgres. A plain `Enum` would need `.value` access at every boundary.
+- **`WorkerResult.status` typed `Literal["ready","failed"]`, not `Status`** — encodes the worker boundary in the type system. A worker literally cannot express `cancelled` or `running`; the engine owns the lifecycle.
+- **`_iso8601` helper** — `datetime.isoformat()` on a tz-aware UTC value yields `+00:00`, not the `Z` the contract requires. One-line helper rather than a per-call fix. Note it is a no-op on naive datetimes; asyncpg returns `TIMESTAMPTZ` as tz-aware, so this holds in practice.
+- **`TaskEvent` omits `task_id`** — history is always fetched scoped to its parent task, so re-embedding the parent id in every entry is redundant. Add it back only if a cross-task audit view appears.
+- **`publish()` is synchronous, not `async def`** — it never awaits. Declaring it async would misrepresent its behaviour and force every caller into a pointless `await`.
+- **`subscribe()` returns the raw bounded `Queue`** rather than a wrapped async generator — `api/events.py` needs to interleave `: ping` heartbeat lines with real events on its own schedule, which a yield-on-event-only generator would make awkward.
+- **Duplicate worker registration raises** rather than silently overwriting. A silently replaced worker is a bug that costs an hour to find.
+- **`collect_result` is a single UPDATE, not a transaction** — single statements are atomic in Postgres. It would need one only if it later also writes to `task_events`.
+- **`get_task_events` is keyed by `task_id`, not `user_id`** — authorisation sits one layer up: `engine.py` is its only caller and always sequences `get_task(user_id, handle)` first. The boundary is deliberate, not absent.
+- **Docker Desktop's containerd image store** mishandles range-requested layer downloads over WSL2, causing truncated pulls. Fix is to disable "Use containerd for pulling and storing images". Documented in the README's known issues since a reviewer on Windows could hit it.
+
 
 ## What I'd do next (if this were more than a week)
 - **Multi-replica workers** with a cluster-wide concurrency budget rather than a per-process one. The lease design already supports it; what's missing is coordinating the limit across replicas.

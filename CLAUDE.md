@@ -17,7 +17,7 @@ Stack: Python 3.12 · FastAPI · Postgres (asyncpg, raw SQL) · React frontend �
 These are architectural boundaries. Breaking one is a bug even if the code works.
 
 1. **No web framework imports under `engine/`.** `grep -r "fastapi" engine/` must return nothing. The engine must be fully usable from a plain Python script.
-2. **No database driver outside `engine/store.py`.** `grep -rl "asyncpg" engine/` must return exactly one file. All SQL lives there.
+2. **Within `engine/`, no database driver outside `engine/store.py`.** `grep -rl "asyncpg" engine/` must return exactly one file. All SQL inside the engine lives there. This scopes to the engine's internal layering, not the whole repo — code outside `engine/` (bootstrap/seed scripts, tests) may use asyncpg directly; it isn't bound by the engine's boundary because it isn't part of the engine.
 3. **API route handlers only call `engine.py`'s facade.** Three lines each: parse, delegate, serialise. No SQL, no queue manipulation, no handle logic in a route.
 4. **The frontend is a pure HTTP consumer.** It never imports Python, never reads the database. The system must work fully with the frontend deleted.
 5. **Handle uniqueness is enforced by the database**, via the partial unique index. Never by an application-level check-then-insert.

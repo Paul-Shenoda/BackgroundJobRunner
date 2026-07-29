@@ -23,10 +23,16 @@ async def allocate(
     user_id: uuid.UUID,
     lane: str,
     params: dict[str, Any],
+    max_attempts: int = 3,
     seeded: bool = False,
     max_retries: int = 5,
 ) -> Task:
     """Compute the lowest free number and insert, retrying on conflict.
+
+    max_attempts here is the retry BUDGET written onto the new row (passed
+    straight through to store.insert_task) — unrelated to max_retries
+    below, which bounds this function's own handle-collision retry loop.
+    Two different "how many times" knobs for two different problems.
 
     This loop does not prevent a race between two concurrent allocators
     reading the same "lowest free number" — it can't, and isn't trying to.
@@ -41,7 +47,9 @@ async def allocate(
     for _ in range(max_retries):
         number = await store.lowest_free_number(user_id, lane)
         try:
-            return await store.insert_task(user_id, lane, number, params, seeded)
+            return await store.insert_task(
+                user_id, lane, number, params, max_attempts=max_attempts, seeded=seeded
+            )
         except HandleConflict:
             continue
     raise HandleAllocationError(
