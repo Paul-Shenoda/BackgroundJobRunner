@@ -33,10 +33,21 @@ export default function Popover({ trigger, children }) {
       ? boundaryEl.getBoundingClientRect()
       : { left: 0, right: window.innerWidth };
 
+    // A real safety margin, not an exact-fit clamp: `boundary.right -
+    // panelWidth` alone would put the panel's edge EXACTLY on the
+    // boundary's edge with zero margin by construction -- verified this
+    // was the actual cause of a near-invisible 1-6px gap a user reported
+    // as "still broken" (measured precisely from their screenshots, not
+    // eyeballed). The row-padding fix earlier hit the identical lesson:
+    // an exact fit reads as broken and is fragile to any small variation
+    // (different date values, font metrics, browser). 12px is comfortably
+    // visible without being wasteful.
+    const MARGIN = 12;
     const panelWidth = panelEl.offsetWidth;
     const naturalLeft = triggerRect.left; // anchored under the trigger, same as before
-    const maxLeft = boundary.right - panelWidth;
-    const clampedLeft = Math.max(boundary.left, Math.min(naturalLeft, maxLeft));
+    const minLeft = boundary.left + MARGIN;
+    const maxLeft = boundary.right - panelWidth - MARGIN;
+    const clampedLeft = Math.max(minLeft, Math.min(naturalLeft, maxLeft));
     setLeft(clampedLeft - triggerRect.left); // as an offset from the trigger's own position
   }, [open]);
 
