@@ -102,6 +102,18 @@ class Task:
             "collected": self.collected,
         }
 
+    def to_detail_dict(self, events: list["TaskEvent"]) -> dict[str, Any]:
+        """The six contract fields plus the extras CLAUDE.md permits on the
+        single-task fetch: attempts, seeded, and full state history. The
+        six core fields keep to_api_dict()'s exact shape — this only adds
+        keys, never changes or removes one."""
+        return {
+            **self.to_api_dict(),
+            "attempts": self.attempts,
+            "seeded": self.seeded,
+            "state_history": [e.to_dict() for e in events],
+        }
+
 
 @dataclass
 class TaskEvent:
@@ -113,3 +125,12 @@ class TaskEvent:
     reason: Optional[str]
     attempt: Optional[int]
     created_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "from_status": self.from_status.value if self.from_status is not None else None,
+            "to_status": self.to_status.value,
+            "reason": self.reason,
+            "attempt": self.attempt,
+            "created_at": _iso8601(self.created_at),
+        }

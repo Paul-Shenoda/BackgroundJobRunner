@@ -16,8 +16,17 @@ async def test_task_object_has_exactly_the_contract_keys(client_a):
         f"missing={CONTRACT_KEYS - set(task.keys())}"
     )
 
-    fetched = await client_a.get(f"/tasks/{task['handle']}")
-    assert set(fetched.json().keys()) == CONTRACT_KEYS
+    # GET /tasks/{handle} is the detail endpoint — CLAUDE.md explicitly
+    # allows extras here (attempts, seeded, state history) for the
+    # dashboard, as long as the six core fields keep their exact shape.
+    # So: contract keys are a subset, not the full set, and the specific
+    # extras this endpoint adds are named explicitly rather than just
+    # tolerated.
+    fetched_keys = set((await client_a.get(f"/tasks/{task['handle']}")).json().keys())
+    assert CONTRACT_KEYS <= fetched_keys, (
+        f"detail response missing contract keys: {CONTRACT_KEYS - fetched_keys}"
+    )
+    assert fetched_keys - CONTRACT_KEYS == {"attempts", "seeded", "state_history"}
 
     await cancel_and_confirm(client_a, task["handle"], task["created_at"])
 
