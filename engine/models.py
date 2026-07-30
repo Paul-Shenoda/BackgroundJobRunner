@@ -110,6 +110,7 @@ class Task:
         return {
             **self.to_api_dict(),
             "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
             "seeded": self.seeded,
             "state_history": [e.to_dict() for e in events],
         }

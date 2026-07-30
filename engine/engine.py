@@ -97,6 +97,7 @@ class Engine:
         self._dsn = dsn
         self._max_attempts = max_attempts
         self._concurrency = concurrency
+        self._heartbeat_interval = heartbeat_interval
         self._store = Store()
         self._registry = WorkerRegistry()
         self._event_bus = EventBus()
@@ -194,6 +195,8 @@ class Engine:
         lane: Optional[str] = None,
         created_after: Optional[datetime] = None,
         created_before: Optional[datetime] = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
         limit: int = 50,
         offset: int = 0,
     ) -> list[Task]:
@@ -203,6 +206,8 @@ class Engine:
             lane=lane,
             created_after=created_after,
             created_before=created_before,
+            sort_by=sort_by,
+            sort_order=sort_order,
             limit=limit,
             offset=offset,
         )
@@ -338,6 +343,7 @@ class Engine:
             "database": database,
             "concurrency": self._concurrency,
             "in_flight": self._pool.running_count(),
+            "heartbeat_interval": self._heartbeat_interval,
         }
 
     def subscribe(self, user_id: uuid.UUID):

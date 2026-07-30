@@ -52,12 +52,18 @@ async def submit_task(
     return task.to_api_dict()
 
 
+_SORT_COLUMNS = {"created_at", "updated_at"}
+_SORT_ORDERS = {"asc", "desc"}
+
+
 @router.get("/tasks")
 async def list_tasks(
     status: str | None = None,
     lane: str | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
     limit: int = 50,
     offset: int = 0,
     user_id: uuid.UUID = Depends(get_current_user_id),
@@ -66,6 +72,16 @@ async def list_tasks(
     status_enum = _parse_status(status) if status is not None else None
     if lane is not None and lane not in engine.lanes():
         raise HTTPException(status_code=400, detail=f"unknown lane {lane!r}")
+    if sort_by not in _SORT_COLUMNS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid sort_by {sort_by!r}; must be one of: {', '.join(_SORT_COLUMNS)}",
+        )
+    if sort_order not in _SORT_ORDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid sort_order {sort_order!r}; must be one of: {', '.join(_SORT_ORDERS)}",
+        )
 
     tasks = await engine.list_tasks(
         user_id,
@@ -73,10 +89,19 @@ async def list_tasks(
         lane=lane,
         created_after=created_after,
         created_before=created_before,
+        sort_by=sort_by,
+        sort_order=sort_order,
         limit=limit,
         offset=offset,
     )
-    return [t.to_api_dict() for t in tasks]
+    # attempts/max_attempts/seeded are additive extras on top of the 9
+    # fixed contract fields (the same extras the detail endpoint exposes)
+    # — the dashboard list needs them for the attempt counter ("2/3") and
+    # SEEDED badge. Nothing here renames or removes a contract field.
+    return [
+        {**t.to_api_dict(), "attempts": t.attempts, "max_attempts": t.max_attempts, "seeded": t.seeded}
+        for t in tasks
+    ]
 
 
 @router.get("/tasks/{handle}")

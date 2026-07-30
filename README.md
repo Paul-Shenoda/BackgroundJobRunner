@@ -228,6 +228,63 @@ real (non-seed) task data too.
 
 ## API Reference
 
+## Frontend
+
+`frontend/` is a Vite + React app -- a pure HTTP consumer of the API above.
+It imports nothing from `engine/`, never touches Postgres, and the system
+works fully with `frontend/` deleted (CLAUDE.md's frontend boundary rule).
+
+### Running in dev
+
+```
+cd frontend
+npm install
+npm run dev
+```
+
+Opens on `http://localhost:5173`. The Vite dev server proxies `/tasks`,
+`/lanes`, `/events`, and `/health` to the FastAPI backend on
+`http://localhost:8000` (see `frontend/vite.config.js`) -- start the API
+separately:
+
+```
+uvicorn api.main:app --reload
+```
+
+On first load you'll land on a card asking for an API key -- use the
+seeded demo keys (`alice-demo-key` / `bob-demo-key`, shown as hints on the
+card itself) or run `python -m scripts.seed` first if the database is
+empty.
+
+### Theme
+
+Dark is the default (an ops console reads as dark by default), but light
+mode is fully supported: it follows the OS/browser's `prefers-color-scheme`
+automatically, and Settings has an explicit System/Light/Dark toggle. The
+toggle is session-only React state, not persisted -- the brief reserves
+`localStorage` for the API key alone, so a forced theme resets to
+"System" on next load rather than being written anywhere.
+
+### Building for production
+
+```
+cd frontend
+npm run build
+```
+
+Emits `frontend/dist`. **How it's served:** `api/main.py` mounts
+`frontend/dist/assets` as static files and serves `frontend/dist/index.html`
+for every other path that isn't a recognised API route (registered last,
+after every real endpoint, so `/tasks`, `/events`, etc. always take
+precedence over the SPA fallback). One container, one process, no CORS
+needed in production since the frontend and API share an origin. In dev,
+`frontend/dist` doesn't exist yet, so FastAPI skips that block entirely and
+the Vite dev server serves the frontend instead.
+
+The existing CORS config (`http://localhost:5173`, plus `FRONTEND_ORIGIN`
+if set) stays in place for local dev, where the frontend and API run as
+two separate processes on two different ports.
+
 ## Testing
 
 ## Deployment

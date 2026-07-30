@@ -9,11 +9,13 @@ outside engine/ (DECISIONS.md, "Engine as a standalone module").
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.auth import load_api_keys
 from api.events import router as events_router
@@ -106,3 +108,28 @@ async def health():
     doing. engine.health() owns every decision here; this route is purely
     parse (nothing to parse), delegate, serialise."""
     return await app.state.engine.health()
+
+
+# Production: one container, one process. `npm run build` emits
+# frontend/dist; FastAPI serves it directly instead of needing a second
+# static-file server or a reverse proxy in front. Registered last so
+# every API route above (matched by exact/parameterised path) always
+# wins before this catch-all — Starlette tries routes in registration
+# order, not by specificity.
+#
+# In dev, frontend/dist doesn't exist (Vite's own dev server serves the
+# frontend directly, proxying API calls back to this process — see
+# frontend/vite.config.js) so this block is skipped entirely.
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        """Any path that isn't a real built asset resolves to index.html —
+        the SPA has no server-rendered routes of its own to 404 on."""
+        candidate = _FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_FRONTEND_DIST / "index.html")

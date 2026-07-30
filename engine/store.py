@@ -231,6 +231,9 @@ class Store:
         )
         return _row_to_task(row) if row is not None else None
 
+    _SORT_COLUMNS = {"created_at", "updated_at"}
+    _SORT_ORDERS = {"asc", "desc"}
+
     async def list_tasks(
         self,
         user_id: uuid.UUID,
@@ -238,13 +241,24 @@ class Store:
         lane: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
         limit: int = 50,
         offset: int = 0,
     ) -> list[Task]:
         """Every user-facing read filters on user_id — a user must never see
         another user's tasks, no exceptions. Filter values are always bound
         as $N placeholders; only fixed column names/operators are
-        interpolated into the query text."""
+        interpolated into the query text.
+
+        sort_by/sort_order are validated against a fixed allowlist before
+        interpolation (never bindable as query params) — the same rule
+        applied to every other fixed column/operator in this method."""
+        if sort_by not in self._SORT_COLUMNS:
+            raise ValueError(f"invalid sort_by {sort_by!r}")
+        if sort_order not in self._SORT_ORDERS:
+            raise ValueError(f"invalid sort_order {sort_order!r}")
+
         conditions = ["user_id = $1"]
         params: list[Any] = [user_id]
 
@@ -269,7 +283,7 @@ class Store:
         query = f"""
             SELECT * FROM tasks
             WHERE {' AND '.join(conditions)}
-            ORDER BY created_at DESC
+            ORDER BY {sort_by} {sort_order}
             LIMIT ${limit_idx} OFFSET ${offset_idx}
         """
         rows = await self._pool.fetch(query, *params)

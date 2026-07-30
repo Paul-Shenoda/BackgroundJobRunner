@@ -26,7 +26,7 @@ async def test_task_object_has_exactly_the_contract_keys(client_a):
     assert CONTRACT_KEYS <= fetched_keys, (
         f"detail response missing contract keys: {CONTRACT_KEYS - fetched_keys}"
     )
-    assert fetched_keys - CONTRACT_KEYS == {"attempts", "seeded", "state_history"}
+    assert fetched_keys - CONTRACT_KEYS == {"attempts", "max_attempts", "seeded", "state_history"}
 
     await cancel_and_confirm(client_a, task["handle"], task["created_at"])
 
