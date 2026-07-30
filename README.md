@@ -187,11 +187,8 @@ python -m scripts.seed
 This creates:
 
 - **Two users** — `Alice` (`X-API-Key: alice-demo-key`) and `Bob`
-  (`X-API-Key: bob-demo-key`). Any other user already in the `users` table
-  (leftover ad-hoc keys from manual testing) is removed, except the pytest
-  fixture users tests/conftest.py and tests/test_restart.py provision —
-  those are left alone so the test suite keeps working against the same
-  database.
+  (`X-API-Key: bob-demo-key`). A bare run never touches any other user —
+  it only ever creates/updates these two and inserts their tasks.
 - **~28 tasks for Alice, ~7 for Bob** — every status represented
   (`queued`, `running`, `ready`, `failed`, `cancelled`), both lanes
   (`scrape`, `report`), a mix of collected/uncollected terminal tasks, and
@@ -213,9 +210,17 @@ reaper doesn't reclaim it on boot.
 Flags:
 
 ```
-python -m scripts.seed --reset   # delete existing seeded rows first, then reseed
-python -m scripts.seed --wipe    # delete ALL rows (tasks + users), asks for confirmation
+python -m scripts.seed --reset               # delete existing seeded rows first, then reseed
+python -m scripts.seed --wipe                # delete ALL rows (tasks + users), asks for confirmation
+python -m scripts.seed --purge-debug-users   # delete non-demo, non-test-fixture users; previews and asks first
 ```
+
+`--purge-debug-users` exists for cleaning up ad-hoc users left behind by
+manual testing (e.g. a one-off key created by hand while poking at the API).
+It is opt-in only — a bare run, and even `--reset`, never delete another
+user — and it always prints exactly who it found and how many tasks they
+have before asking for confirmation, since deleting a user cascades to their
+real (non-seed) task data too.
 
 ### Known issues
 

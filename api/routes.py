@@ -85,9 +85,9 @@ async def get_task(
     user_id: uuid.UUID = Depends(get_current_user_id),
     engine: Engine = Depends(get_engine),
 ):
-    """The six contract fields plus attempts/seeded/state_history — CLAUDE.md
-    permits extra fields on this single-task fetch for the dashboard's
-    detail view, unlike the list endpoint."""
+    """The nine contract fields plus attempts/seeded/state_history —
+    CLAUDE.md permits extra fields on this single-task fetch for the
+    dashboard's detail view, unlike the list endpoint."""
     detail = await engine.get_detail(user_id, handle)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"no task {handle!r}")

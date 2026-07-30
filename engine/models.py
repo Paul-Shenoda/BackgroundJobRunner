@@ -103,9 +103,9 @@ class Task:
         }
 
     def to_detail_dict(self, events: list["TaskEvent"]) -> dict[str, Any]:
-        """The six contract fields plus the extras CLAUDE.md permits on the
+        """The nine contract fields plus the extras CLAUDE.md permits on the
         single-task fetch: attempts, seeded, and full state history. The
-        six core fields keep to_api_dict()'s exact shape — this only adds
+        nine core fields keep to_api_dict()'s exact shape — this only adds
         keys, never changes or removes one."""
         return {
             **self.to_api_dict(),

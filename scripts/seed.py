@@ -2,7 +2,12 @@
 state history for each.
 
 Run as:
-    python -m scripts.seed [--reset] [--wipe]
+    python -m scripts.seed [--reset] [--wipe] [--purge-debug-users]
+
+A bare run only ever touches Alice's and Bob's own rows -- it never deletes
+another user. --purge-debug-users is the one opt-in exception: it previews
+which non-demo, non-test-fixture users exist and asks for confirmation
+before deleting them and their tasks. See PROTECTED_KEYS below.
 
 Reads DATABASE_URL from .env (or the environment), same as every other
 script in scripts/.
@@ -367,21 +372,35 @@ def to_jsonb(value: Optional[dict]) -> Optional[str]:
     return None if value is None else json.dumps(value)
 
 
-async def purge_debug_users(conn: asyncpg.Connection) -> list[tuple[str, str]]:
-    """Delete every user that isn't Alice/Bob or a known pytest fixture
-    user -- leftover ad-hoc debug keys from manual testing sessions. Tasks
-    are deleted first: tasks.user_id has no ON DELETE CASCADE (unlike
-    task_events -> tasks), so the user row can't go first.
+async def find_debug_users(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """Users that aren't Alice/Bob or a known pytest fixture user --
+    candidates for purge_debug_users, along with how many task rows
+    deleting each one would take with it. Read-only: never gated, since
+    reporting what a purge WOULD touch is always safe to compute."""
+    rows = await conn.fetch(
+        """
+        SELECT u.id, u.name, u.api_key, count(t.id) AS task_count
+        FROM users u LEFT JOIN tasks t ON t.user_id = u.id
+        GROUP BY u.id, u.name, u.api_key
+        """
+    )
+    return [dict(row) for row in rows if row["api_key"] not in PROTECTED_KEYS]
+
+
+async def purge_debug_users(conn: asyncpg.Connection, candidates: list[dict[str, Any]]) -> None:
+    """Delete exactly the given users and their tasks. Tasks are deleted
+    first: tasks.user_id has no ON DELETE CASCADE (unlike task_events ->
+    tasks), so the user row can't go first.
+
+    Deliberately takes an explicit candidate list rather than re-querying
+    PROTECTED_KEYS itself -- this is the only place in the script that
+    deletes another user's real data, not just seed rows, so the caller is
+    required to have already shown the operator exactly what this will
+    touch (see main()) before this runs.
     """
-    rows = await conn.fetch("SELECT id, name, api_key FROM users")
-    removed = []
-    for row in rows:
-        if row["api_key"] in PROTECTED_KEYS:
-            continue
+    for row in candidates:
         await conn.execute("DELETE FROM tasks WHERE user_id = $1", row["id"])
         await conn.execute("DELETE FROM users WHERE id = $1", row["id"])
-        removed.append((row["name"], row["api_key"]))
-    return removed
 
 
 async def insert_tasks(conn: asyncpg.Connection, alice_id: uuid.UUID, bob_id: uuid.UUID) -> None:
@@ -474,6 +493,15 @@ async def main() -> None:
     parser.add_argument(
         "--wipe", action="store_true", help="delete ALL rows (tasks and users), not just seed data"
     )
+    parser.add_argument(
+        "--purge-debug-users",
+        action="store_true",
+        help=(
+            "delete users that aren't Alice/Bob or a pytest fixture user, along with their "
+            "tasks. Never runs implicitly -- shows exactly who would be deleted and asks "
+            "for confirmation first."
+        ),
+    )
     args = parser.parse_args()
 
     if args.wipe:
@@ -494,10 +522,31 @@ async def main() -> None:
             result = await conn.execute("DELETE FROM tasks WHERE seeded = true")
         print(f"Reset: {result}")
 
-    async with connection(DSN) as conn:
-        removed = await purge_debug_users(conn)
-    for name, key in removed:
-        print(f"Removed ad-hoc debug user {name!r} ({key})")
+    # Opt-in only, and only when --wipe hasn't already deleted every user
+    # (asking to confirm a purge of zero remaining users would be noise).
+    # This deletes OTHER users' real, non-seed task data via their user_id
+    # -- unlike --reset/--wipe above, there is no "seeded = true" or
+    # blanket-delete framing to fall back on, so a bare `python -m
+    # scripts.seed` must never reach this path, and even an explicit
+    # --purge-debug-users run confirms against a concrete, named preview
+    # rather than deleting on a promise of what it will find.
+    if args.purge_debug_users and not args.wipe:
+        async with connection(DSN) as conn:
+            candidates = await find_debug_users(conn)
+        if not candidates:
+            print("No ad-hoc debug users found.")
+        else:
+            print("The following users are not Alice/Bob or a pytest fixture user:")
+            for row in candidates:
+                print(f"  {row['name']!r} ({row['api_key']}) -- {row['task_count']} task(s)")
+            confirm = input("Type 'yes' to delete them and their tasks: ")
+            if confirm.strip().lower() != "yes":
+                print("Skipped debug-user purge.")
+            else:
+                async with connection(DSN) as conn:
+                    await purge_debug_users(conn, candidates)
+                for row in candidates:
+                    print(f"Removed {row['name']!r} ({row['api_key']})")
 
     alice_id = await ensure_user(DSN, ALICE_NAME, ALICE_KEY)
     bob_id = await ensure_user(DSN, BOB_NAME, BOB_KEY)

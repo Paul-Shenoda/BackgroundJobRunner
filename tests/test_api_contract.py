@@ -18,7 +18,7 @@ async def test_task_object_has_exactly_the_contract_keys(client_a):
 
     # GET /tasks/{handle} is the detail endpoint — CLAUDE.md explicitly
     # allows extras here (attempts, seeded, state history) for the
-    # dashboard, as long as the six core fields keep their exact shape.
+    # dashboard, as long as the nine core fields keep their exact shape.
     # So: contract keys are a subset, not the full set, and the specific
     # extras this endpoint adds are named explicitly rather than just
     # tolerated.
