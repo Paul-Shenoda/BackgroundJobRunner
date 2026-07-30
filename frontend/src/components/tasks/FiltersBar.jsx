@@ -62,7 +62,10 @@ export default function FiltersBar() {
     // column), overflowing past the column's own right edge while still
     // comfortably inside the full browser viewport (invisible to a check
     // that only compares against document width).
-    <div className="flex items-center gap-1 border-b border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-2.5 py-3">
+    <div
+      data-popover-boundary
+      className="flex items-center gap-1 border-b border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-2.5 py-3"
+    >
       {/* Quick filters: one-click presets over the SAME filters.status the
           popover's multi-select controls -- always visible, at every
           breakpoint. */}
