@@ -31,6 +31,13 @@
 
 ## Decision log
 
+### [2026-07-30] — Cancelled rows get the same dimming as collected rows
+- **Context:** Collected-row dimming (opacity-50) was extended to cancelled rows too. Not a simple `||` on the existing check: cancelled tasks never carry `collected: true` (there's no collect action for a cancelled task -- `Actions` in `TaskDetail.jsx` only offers Collect for `ready`/`failed`), so the dimming condition needed its own explicit `task.status === "cancelled"` check alongside `task.collected`, not a fold into one.
+- **Why the same treatment fits:** both are "done, nothing left to do here" from an operator's perspective -- collected via acknowledgment, cancelled via an explicit stop. Neither competes with active (queued/running) or newly-terminal-and-unacknowledged (ready/failed, uncollected) work for visual attention.
+- **Verified via computed style**, not visual read: every rendered "Cancelled" row measures `opacity: 0.5`, matching collected rows exactly.
+- **Tradeoff / cost:** None meaningful.
+- **Revisit if:** N/A.
+
 ### [2026-07-30] — Date-range inputs clipped their own calendar icon; the panel was narrower than its own content actually needed
 - **Context:** A third, distinct bug in the same feature area, this time neither the row nor the popover's position but the panel's own internal content: the second ("to") date input's calendar icon was visibly cut off. User correctly guessed this was likely too fine a margin to see via pixel-diffing and suggested just widening the panel.
 - **Measured before changing anything:** two `<input type="date">` elements side by side in a `flex-1` row inside a `w-72` (288px) panel. Measured precisely (Playwright): each native date input has an intrinsic width of 130px that the browser won't shrink below gracefully -- past that point the calendar icon gets clipped rather than the whole input compressing. The row's unshrunk content needed ~287px; only 254px was available. The second input's right edge sat 16px past the panel's own right edge, exactly matching the clipped icon in the screenshot.

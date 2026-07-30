@@ -11,6 +11,11 @@ export default function TaskRow({ task }) {
   // share a handle (recycling), and only the row actually clicked should
   // highlight (see NavContext).
   const active = selectedTask?.handle === task.handle && selectedTask?.createdAt === task.created_at;
+  // Same ranking rule for both: collected (acknowledged) and cancelled are
+  // both "done, nothing left to do here" -- cancelled tasks never carry
+  // collected=true (there's no collect action for them), so this needs its
+  // own check rather than folding into the collected condition.
+  const isDimmed = task.collected || task.status === "cancelled";
 
   return (
     <button
@@ -18,12 +23,10 @@ export default function TaskRow({ task }) {
       className={
         "flex w-full items-center gap-3 border-b border-[color:var(--color-hairline-soft)] px-4 py-3 text-left transition-colors " +
         (active ? "bg-[color:var(--color-accent-soft)]" : "hover:bg-[color:var(--color-surface)]") +
-        // Collected rows are done and acknowledged -- ranked below active
-        // work visually (reduced opacity), not hidden. hover:opacity-100
-        // restores full weight while actually looking at one. 50%, not
-        // 70% -- asked to make this stand out more after the first pass
-        // read as too subtle at a glance.
-        (task.collected ? " opacity-50 hover:opacity-100" : "")
+        // Done-and-acknowledged rows are ranked below active work visually
+        // (reduced opacity), not hidden. hover:opacity-100 restores full
+        // weight while actually looking at one.
+        (isDimmed ? " opacity-50 hover:opacity-100" : "")
       }
       style={{ borderLeft: `3px solid ${meta.color}` }}
     >
