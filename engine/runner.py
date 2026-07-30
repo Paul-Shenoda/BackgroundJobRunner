@@ -412,6 +412,30 @@ class WorkerPool:
         job_task.cancel()
         return True
 
+    def is_running(self) -> bool:
+        """True if both background loops are still alive. A process-local
+        liveness signal for GET /health: the dispatch and reaper loops now
+        log loudly instead of dying silently on an unhandled exception (see
+        DECISIONS.md), but "logged" doesn't mean "the loop is still there"
+        — if either task has actually ended, the process keeps accepting
+        HTTP requests while quietly no longer claiming or reaping work,
+        which is exactly the degraded state /health needs to be able to
+        tell apart from a healthy one."""
+        return (
+            self._dispatch_task is not None
+            and not self._dispatch_task.done()
+            and self._reaper_task is not None
+            and not self._reaper_task.done()
+        )
+
+    def running_count(self) -> int:
+        """len(self._running) — jobs this process currently has in flight.
+        Process-local by construction, no DB round trip: it answers "is
+        this process doing anything," not "how much work is queued
+        cluster-wide" (that's queue depth, a different and DB-backed
+        question — see DECISIONS.md on why GET /health doesn't answer it)."""
+        return len(self._running)
+
     async def _reaper_loop(self) -> None:
         """The periodic half of restart recovery. start() already runs
         reap_expired_leases() once at boot; this covers the case boot-only

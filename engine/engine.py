@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from engine.events import EventBus, LifecycleEvent
 from engine.handles import HandleAllocationError, allocate
@@ -32,7 +32,34 @@ from engine.registry import UnknownLaneError, Worker, WorkerRegistry
 from engine.runner import WorkerPool
 from engine.store import Store
 
-__all__ = ["Engine", "UnknownLaneError", "HandleAllocationError"]
+__all__ = [
+    "Engine",
+    "UnknownLaneError",
+    "HandleAllocationError",
+    "TaskNotFoundError",
+    "TaskConflictError",
+]
+
+
+class TaskNotFoundError(Exception):
+    """No task exists for this handle under this user. Maps to 404."""
+
+
+class TaskConflictError(Exception):
+    """Task exists but is not in a state the requested operation can act on
+    right now (still queued/running when collect was called, already
+    terminal when cancel was called, not failed when retry was called, or
+    already collected). Maps to 409.
+
+    `reason` is deliberately specific (CLAUDE.md: "failure reasons must be
+    specific") rather than a generic "invalid state" — the whole point of
+    raising this instead of returning None is to let the API surface
+    exactly why, not just that."""
+
+    def __init__(self, handle: str, reason: str) -> None:
+        self.handle = handle
+        self.reason = reason
+        super().__init__(reason)
 
 
 class Engine:
@@ -50,6 +77,7 @@ class Engine:
     ) -> None:
         self._dsn = dsn
         self._max_attempts = max_attempts
+        self._concurrency = concurrency
         self._store = Store()
         self._registry = WorkerRegistry()
         self._event_bus = EventBus()
@@ -178,14 +206,35 @@ class Engine:
         events = await self._store.get_task_events(task.id)
         return task, events
 
-    async def collect(self, user_id: uuid.UUID, handle: str) -> Optional[Task]:
+    async def collect(self, user_id: uuid.UUID, handle: str) -> Task:
         """Works for 'ready' AND 'failed' — collection is the ACK that
         releases the handle for reuse either way, not just on success.
-        Returns None if the task isn't collectable: wrong status, or
-        already collected."""
-        return await self._store.collect_result(user_id, handle)
 
-    async def cancel(self, user_id: uuid.UUID, handle: str) -> Optional[Task]:
+        Raises TaskNotFoundError if no such handle exists for this user.
+        Raises TaskConflictError if the handle exists but isn't collectable
+        right now: still queued/running, or already collected.
+
+        store.collect_result's single UPDATE can't distinguish those two
+        failure modes from "no such row" in one round trip — a WHERE
+        clause matching zero rows looks the same either way. Rather than
+        widen that query (and risk the same ambiguity get_task's docstring
+        already worked through once), a miss here triggers one extra
+        get_task lookup purely to build an honest, specific reason. Success
+        stays a single query; only the failure path pays for the lookup.
+        """
+        task = await self._store.collect_result(user_id, handle)
+        if task is not None:
+            return task
+        current = await self._store.get_task(user_id, handle)
+        if current is None:
+            raise TaskNotFoundError(handle)
+        if current.collected:
+            raise TaskConflictError(handle, f"{handle} was already collected")
+        raise TaskConflictError(
+            handle, f"{handle} is {current.status.value}, not ready or failed yet"
+        )
+
+    async def cancel(self, user_id: uuid.UUID, handle: str) -> Task:
         """Cancel a queued or running task.
 
         Ordering is load-bearing, not a style choice: mark the DB row
@@ -200,17 +249,27 @@ class Engine:
         finishes afterward finds its own conditional UPDATE affects zero
         rows and correctly records nothing. Criterion 6 depends on exactly
         this — no late 'ready' event may ever arrive for a cancelled job.
+
+        Raises TaskNotFoundError if no such handle exists for this user.
+        Raises TaskConflictError if the handle exists but is already
+        terminal (ready/failed/cancelled) — cancel_task's WHERE clause is
+        `status IN ('queued','running')`, unambiguous by construction (see
+        store.py), so a miss here has exactly one explanation and the
+        follow-up get_task lookup exists only to name that status.
         """
         task = await self._store.cancel_task(user_id, handle)
         if task is None:
-            return None
+            current = await self._store.get_task(user_id, handle)
+            if current is None:
+                raise TaskNotFoundError(handle)
+            raise TaskConflictError(handle, f"{handle} is already {current.status.value}")
         await self._pool.cancel_running(task.id)
         self._event_bus.publish(
             LifecycleEvent.cancelled(user_id=user_id, handle=task.handle, lane=task.lane)
         )
         return task
 
-    async def retry(self, user_id: uuid.UUID, handle: str) -> Optional[Task]:
+    async def retry(self, user_id: uuid.UUID, handle: str) -> Task:
         """Operator-triggered retry of a failed job: failed -> queued,
         attempts reset to 0, error cleared (store.reset_for_retry).
 
@@ -223,10 +282,44 @@ class Engine:
         DECISIONS.md, "A retry emits no lifecycle event"). The transition
         is still fully recorded in task_events via reset_for_retry.
 
-        Returns None if the task isn't in 'failed' — there is nothing to
-        retry.
+        Raises TaskNotFoundError if no such handle exists for this user.
+        Raises TaskConflictError if the handle exists but isn't retryable:
+        reset_for_retry's WHERE is `status = 'failed' AND collected =
+        false`, so a miss means either wrong status or already collected —
+        the follow-up get_task lookup disambiguates which.
         """
-        return await self._store.reset_for_retry(user_id, handle)
+        task = await self._store.reset_for_retry(user_id, handle)
+        if task is not None:
+            return task
+        current = await self._store.get_task(user_id, handle)
+        if current is None:
+            raise TaskNotFoundError(handle)
+        if current.status != Status.FAILED:
+            raise TaskConflictError(handle, f"{handle} is {current.status.value}, not failed")
+        raise TaskConflictError(handle, f"{handle} was already collected")
+
+    async def health(self) -> dict[str, Any]:
+        """Liveness signals for GET /health: is this process working, not
+        how much work it's doing. Every value here is either static config
+        (concurrency) or process-local state (engine, in_flight) — the one
+        DB round trip (database) exists purely to answer "reachable or
+        not," never to report on task content. Deliberately excludes queue
+        depth/counts: those are workload data, not health, and getting them
+        would mean either a DB query with no user to scope it by or
+        widening this method into the one cross-user read path in an
+        otherwise fully user-scoped facade (see DECISIONS.md — considered
+        and reversed)."""
+        try:
+            await self._store.ping()
+            database = "reachable"
+        except Exception:
+            database = "unreachable"
+        return {
+            "engine": "running" if self._pool.is_running() else "stopped",
+            "database": database,
+            "concurrency": self._concurrency,
+            "in_flight": self._pool.running_count(),
+        }
 
     def subscribe(self, user_id: uuid.UUID):
         """Returns the raw bounded queue from EventBus. The engine knows

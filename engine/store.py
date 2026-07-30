@@ -275,6 +275,14 @@ class Store:
         rows = await self._pool.fetch(query, *params)
         return [_row_to_task(row) for row in rows]
 
+    async def ping(self) -> None:
+        """Trivial connectivity check for GET /health: one round trip, no
+        rows to interpret. Raises whatever asyncpg raises on a dead pool or
+        connection — this method doesn't decide what "unreachable" means,
+        it just makes the real attempt; engine.health() is what turns a
+        raise into the string "unreachable"."""
+        await self._pool.fetchval("SELECT 1")
+
     async def get_task_events(self, task_id: uuid.UUID) -> list[TaskEvent]:
         """Ordered ascending — chronological state history.
 
