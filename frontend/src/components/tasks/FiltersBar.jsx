@@ -1,6 +1,5 @@
 import { useTasks } from "../../context/TasksContext";
 import { useLanes } from "../../hooks/useLanes";
-import { useBreakpoint } from "../../hooks/useMediaQuery";
 import { STATUSES, STATUS_META } from "../../lib/format";
 import { IconPlus, IconFilter, IconSort, IconCheck } from "../icons";
 import { useNav } from "../../context/NavContext";
@@ -33,7 +32,7 @@ const SORT_FIELDS = [
 ];
 
 const controlClass =
-  "flex items-center gap-1.5 rounded-lg border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] px-2.5 py-1.5 text-xs text-[color:var(--color-ink)] hover:bg-[color:var(--color-surface-raised)]";
+  "flex items-center gap-1 rounded-lg border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] px-2 py-1.5 text-xs text-[color:var(--color-ink)] hover:bg-[color:var(--color-surface-raised)]";
 
 const selectClass =
   "rounded-lg border border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-2.5 py-1.5 text-xs text-[color:var(--color-ink)] outline-none focus:border-[color:var(--color-accent)]";
@@ -41,7 +40,6 @@ const selectClass =
 export default function FiltersBar() {
   const { filters, setFilters } = useTasks();
   const { setNewTaskOpen } = useNav();
-  const { isDesktop } = useBreakpoint();
   const preset = activePreset(filters.status);
 
   const filterCount =
@@ -53,7 +51,18 @@ export default function FiltersBar() {
   const sortArrow = filters.sortOrder === "asc" ? "↑" : "↓";
 
   return (
-    <div className="flex items-center gap-1.5 border-b border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-3 py-3 sm:px-4">
+    // Flat padding/gap, no viewport-based sm: escalation: this row's real
+    // available width does NOT track viewport width. On desktop it sits in
+    // a fixed 420px list column (see TasksPage.jsx) regardless of how wide
+    // the browser window is; on tablet (icon-rail, single pane) it actually
+    // has MORE room than "desktop" despite the narrower viewport. A prior
+    // version used sm:px-4 assuming "wider viewport = more room," which is
+    // true for the page but false for this specific component -- it made
+    // the row wider exactly in its tightest real context (the 420px
+    // column), overflowing past the column's own right edge while still
+    // comfortably inside the full browser viewport (invisible to a check
+    // that only compares against document width).
+    <div className="flex items-center gap-1 border-b border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-2.5 py-3">
       {/* Quick filters: one-click presets over the SAME filters.status the
           popover's multi-select controls -- always visible, at every
           breakpoint. */}
@@ -63,7 +72,7 @@ export default function FiltersBar() {
             key={f.id}
             onClick={() => setFilters({ status: f.statuses })}
             className={
-              "rounded-md px-2 py-1 text-xs font-medium transition-colors " +
+              "rounded-md px-1.5 py-1 text-xs font-medium transition-colors " +
               (preset === f.id
                 ? "bg-[color:var(--color-accent)] text-white"
                 : "text-[color:var(--color-ink-dim)] hover:text-[color:var(--color-ink)]")
@@ -78,12 +87,18 @@ export default function FiltersBar() {
         trigger={(toggle, open) => (
           <button
             onClick={toggle}
+            title="Filters"
             className={
               controlClass + " shrink-0 whitespace-nowrap" + (open ? " border-[color:var(--color-accent)]" : "")
             }
           >
             <IconFilter />
-            {isDesktop && <span>Filters</span>}
+            {/* Icon-only, same reasoning as Sort below: "available width"
+                for this component doesn't track viewport breakpoint (the
+                420px desktop column is narrower than the tablet single-pane
+                view despite being "desktop"), so there's no viewport-based
+                condition that's actually safe here. The badge count already
+                communicates state without needing the word "Filters". */}
             {filterCount > 0 && (
               <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-[color:var(--color-accent)] px-1 text-[10px] font-semibold text-white">
                 {filterCount}
@@ -120,7 +135,7 @@ export default function FiltersBar() {
       <button
         type="button"
         onClick={() => setNewTaskOpen(true)}
-        className="ml-auto flex shrink-0 items-center gap-1 rounded-lg bg-[color:var(--color-accent)] px-2.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 sm:gap-1.5 sm:px-3"
+        className="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[color:var(--color-accent)] px-2 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
       >
         <IconPlus />
         New task
