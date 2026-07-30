@@ -78,7 +78,9 @@ export default function FiltersBar() {
         trigger={(toggle, open) => (
           <button
             onClick={toggle}
-            className={controlClass + (open ? " border-[color:var(--color-accent)]" : "")}
+            className={
+              controlClass + " shrink-0 whitespace-nowrap" + (open ? " border-[color:var(--color-accent)]" : "")
+            }
           >
             <IconFilter />
             {isDesktop && <span>Filters</span>}
@@ -97,14 +99,18 @@ export default function FiltersBar() {
         trigger={(toggle, open) => (
           <button
             onClick={toggle}
-            className={controlClass + (open ? " border-[color:var(--color-accent)]" : "")}
+            title={`Sort: ${sortLabel}, ${filters.sortOrder === "asc" ? "ascending" : "descending"}`}
+            className={
+              controlClass + " shrink-0 whitespace-nowrap" + (open ? " border-[color:var(--color-accent)]" : "")
+            }
           >
             <IconSort />
-            {isDesktop && (
-              <span>
-                {sortLabel} {sortArrow}
-              </span>
-            )}
+            {/* Icon-only, always -- "Created"/"Updated" differ enough in
+                width that showing the field name here could wrap onto a
+                second line and grow the whole row (see DECISIONS.md). The
+                arrow alone is a single fixed-width glyph, so it can't. The
+                full field name is one click away in the popover. */}
+            <span>{sortArrow}</span>
           </button>
         )}
       >
