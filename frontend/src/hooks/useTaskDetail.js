@@ -7,7 +7,16 @@ import { useEventStream } from "../context/EventStreamContext";
 // the brief's single best live-update demo (watching running -> ready
 // with state history growing) depends on this NOT requiring a
 // close-and-reopen to see the next state.
-export function useTaskDetail(handle) {
+//
+// taskKey disambiguates SELECTION from the actual API call: GET
+// /tasks/{handle} only ever takes a handle (the fixed contract has no
+// way to address one specific historical row when two share a handle --
+// see DECISIONS.md, "a handle identifies an active task, not a task").
+// Switching between two rows that happen to share a handle would
+// otherwise not reset loading/task state at all, since `handle` itself
+// wouldn't have changed -- taskKey (handle+created_at) is what forces
+// that reset even when the handle string is identical.
+export function useTaskDetail(handle, taskKey = handle) {
   const { apiKey } = useAuth();
   const { subscribe } = useEventStream();
   const [task, setTask] = useState(null);
@@ -41,7 +50,8 @@ export function useTaskDetail(handle) {
     setTask(null);
     setError(null);
     refetch();
-  }, [refetch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refetch, taskKey]);
 
   useEffect(() => {
     if (!handle) return;

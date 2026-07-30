@@ -8,6 +8,12 @@ import { IconClose } from "../icons";
 const inputClass =
   "rounded-lg border border-[color:var(--color-hairline)] bg-[color:var(--color-void)] px-3 py-2 text-sm text-[color:var(--color-ink)] outline-none focus:border-[color:var(--color-accent)]";
 
+const FAILURE_MODES = [
+  { value: "none", label: "No failure" },
+  { value: "retryable", label: "Fail (retryable)" },
+  { value: "permanent", label: "Fail permanently" },
+];
+
 export default function NewTaskSheet() {
   const { newTaskOpen, setNewTaskOpen } = useNav();
   const { apiKey } = useAuth();
@@ -15,8 +21,12 @@ export default function NewTaskSheet() {
 
   const [lane, setLane] = useState("");
   const [durationMs, setDurationMs] = useState(5000);
-  const [fail, setFail] = useState(false);
-  const [failPermanent, setFailPermanent] = useState(false);
+  // A three-way radio, not two independent toggles: the mock worker only
+  // has one real failure outcome per run (fail_permanent takes precedence
+  // when both are set -- see engine/workers/mock.py), so "both on" was a
+  // representable-but-meaningless state. A radio removes it structurally
+  // instead of validating against it after the fact.
+  const [failureMode, setFailureMode] = useState("none");
   const [rawParams, setRawParams] = useState("");
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
@@ -35,8 +45,8 @@ export default function NewTaskSheet() {
     setError(null);
 
     let params = { duration_ms: Number(durationMs) || 0 };
-    if (fail) params.fail = true;
-    if (failPermanent) params.fail_permanent = true;
+    if (failureMode === "retryable") params.fail = true;
+    if (failureMode === "permanent") params.fail_permanent = true;
 
     if (rawParams.trim()) {
       try {
@@ -56,8 +66,7 @@ export default function NewTaskSheet() {
     try {
       await submitTask(apiKey, effectiveLane, params);
       close();
-      setFail(false);
-      setFailPermanent(false);
+      setFailureMode("none");
       setRawParams("");
     } catch (err) {
       setError(err instanceof ApiError ? err.detail || err.message : String(err));
@@ -103,10 +112,25 @@ export default function NewTaskSheet() {
           />
         </label>
 
-        <div className="flex flex-col gap-2">
-          <Toggle checked={fail} onChange={setFail} label="Make this fail (retryable)" />
-          <Toggle checked={failPermanent} onChange={setFailPermanent} label="Fail permanently (no retry)" />
-        </div>
+        <fieldset className="flex flex-col gap-2">
+          <legend className="mb-0.5 text-xs text-[color:var(--color-ink-dim)]">Failure mode</legend>
+          {FAILURE_MODES.map((opt) => (
+            <label
+              key={opt.value}
+              className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--color-ink)]"
+            >
+              <input
+                type="radio"
+                name="failureMode"
+                value={opt.value}
+                checked={failureMode === opt.value}
+                onChange={() => setFailureMode(opt.value)}
+                className="h-3.5 w-3.5 accent-[color:var(--color-accent)]"
+              />
+              {opt.label}
+            </label>
+          ))}
+        </fieldset>
 
         <label className="flex flex-col gap-1.5 text-xs text-[color:var(--color-ink-dim)]">
           Extra params (JSON, optional)
@@ -130,26 +154,5 @@ export default function NewTaskSheet() {
         </button>
       </form>
     </div>
-  );
-}
-
-function Toggle({ checked, onChange, label }) {
-  return (
-    <label className="flex cursor-pointer items-center justify-between text-xs text-[color:var(--color-ink)]">
-      {label}
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className="relative h-5 w-9 shrink-0 rounded-full transition-colors"
-        style={{ background: checked ? "var(--color-accent)" : "var(--color-hairline)" }}
-      >
-        <span
-          className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform"
-          style={{ transform: checked ? "translateX(18px)" : "translateX(2px)" }}
-        />
-      </button>
-    </label>
   );
 }

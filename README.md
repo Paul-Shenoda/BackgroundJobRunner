@@ -196,9 +196,9 @@ This creates:
   something to filter. Every failed row has a distinct, honest reason
   (some exhausted-retry wording, some permanent), and every task has a
   plausible `task_events` history backing its detail view.
-- Every seeded row has `seeded: true` (visible on `GET /tasks/{handle}`,
-  never on the core `GET /tasks` list shape) so it's never mistaken for
-  real activity.
+- Every seeded row has `seeded: true` (returned by both `GET /tasks` and
+  `GET /tasks/{handle}` — additive extras on top of the 9 fixed contract
+  fields, see DECISIONS.md) so it's never mistaken for real activity.
 
 Rows are inserted directly via SQL, not through `engine.submit()` — a
 seeded `queued` row would otherwise get claimed and actually "run" the
@@ -206,6 +206,16 @@ moment the app starts. The couple of seeded `queued` rows carry a
 `not_before` decades in the future for the same reason, and the one seeded
 `running` row carries a `lease_expires_at` decades in the future so the
 reaper doesn't reclaim it on boot.
+
+**Those seeded `queued` rows are permanently inert, on purpose.** With
+`not_before` decades out, the dispatch loop's `claim_next` will never
+select them — they'll sit in `queued` forever, not just until the next
+poll. That's deliberate (see above: a real `queued` row would get claimed
+and run within a second of boot, defeating the point of seed data looking
+like seed data), but it reads as a stuck job if you don't know why when
+filtering the dashboard by `status=queued`. A couple are kept specifically
+so that filter has something to show; the `SEEDED` badge is what tells you
+they're not actually stuck.
 
 Flags:
 
@@ -227,6 +237,41 @@ real (non-seed) task data too.
 **Docker Desktop + WSL2: pulls fail with truncated layers.** Docker Desktop's containerd image store mishandles range-requested downloads over WSL2, causing `httpReadSeeker: failed open ... EOF` mid-pull. Affects both Windows 10 and 11. Fix: in Docker Desktop, **Settings → General**, disable **"Use containerd for pulling and storing images"**, then Apply & Restart.
 
 ## API Reference
+
+### Provisioning a real user's API key
+
+There is deliberately no signup flow — no registration form, no email
+verification, no key rotation (see DECISIONS.md, "Auth beyond API
+keys... no signup, login, password reset, or key rotation"). The brief
+asks for "a per-user API key scoped to that user's data," not a user
+management system, so keys are provisioned by an operator, out of band.
+
+Every current caller that needs a user — `scripts/seed.py`'s demo users,
+the API's own seeded users at startup, the pytest fixtures — goes through
+the same idempotent function: `scripts.bootstrap.ensure_user(dsn, name,
+api_key)`. It's `INSERT ... ON CONFLICT (api_key) DO UPDATE ... RETURNING
+id` — safe to run again with the same key, and the only place a user row
+gets created. There's no CLI wrapper around it (nothing here needed one
+until this point), so an operator provisioning a new real user runs it
+directly:
+
+```
+python -c "
+import asyncio, os
+from dotenv import load_dotenv
+from scripts.bootstrap import ensure_user
+
+load_dotenv()
+user_id = asyncio.run(ensure_user(os.environ['DATABASE_URL'], 'Carol', 'carol-prod-key'))
+print(f'user_id={user_id}')
+"
+```
+
+Hand `carol-prod-key` to Carol; she sends it as `X-API-Key` on every
+request from then on. Nothing else to configure — the in-memory
+`api_key -> user_id` cache (`api/auth.py`) is loaded once at process
+startup, so a newly provisioned key needs the API process restarted (or,
+in production, the next natural redeploy) before it's recognized.
 
 ## Frontend
 

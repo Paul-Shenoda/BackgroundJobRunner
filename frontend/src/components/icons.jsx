@@ -54,6 +54,14 @@ export function IconChevronDown(props) {
   );
 }
 
+export function IconCheck(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" {...base} {...props}>
+      <path d="M5 13l4 4L19 7" />
+    </svg>
+  );
+}
+
 export function IconAlert(props) {
   return (
     <svg viewBox="0 0 24 24" width="18" height="18" {...base} {...props}>

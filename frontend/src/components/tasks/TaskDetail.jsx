@@ -1,11 +1,25 @@
 import { useTaskDetail } from "../../hooks/useTaskDetail";
+import { useElapsedSeconds, formatElapsed } from "../../hooks/useElapsedSeconds";
 import { absoluteTime, relativeTime } from "../../lib/format";
 import StatusPill from "../StatusPill";
 import { IconBack, IconAlert, IconClose } from "../icons";
 
-export default function TaskDetail({ handle, onBack }) {
+function runningSince(stateHistory) {
+  for (let i = stateHistory.length - 1; i >= 0; i--) {
+    if (stateHistory[i].to_status === "running") return stateHistory[i].created_at;
+  }
+  return null;
+}
+
+export default function TaskDetail({ task: selectedTask, onBack }) {
+  const { handle, createdAt } = selectedTask;
+  const taskKey = `${handle}::${createdAt ?? ""}`;
   const { task, loading, error, actionError, clearActionError, cancel, retry, collect } =
-    useTaskDetail(handle);
+    useTaskDetail(handle, taskKey);
+
+  const elapsedSeconds = useElapsedSeconds(
+    task?.status === "running" ? runningSince(task.state_history) : null
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -51,6 +65,11 @@ export default function TaskDetail({ handle, onBack }) {
               <span className="font-mono-tabular text-xs text-[color:var(--color-ink-faint)]">
                 attempts {task.attempts}/{task.max_attempts}
               </span>
+              {elapsedSeconds != null && (
+                <span className="font-mono-tabular text-xs text-[color:var(--color-running)]">
+                  running for {formatElapsed(elapsedSeconds)}
+                </span>
+              )}
               {task.collected && (
                 <span className="text-xs text-[color:var(--color-ink-faint)]">collected</span>
               )}

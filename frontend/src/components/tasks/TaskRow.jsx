@@ -1,16 +1,20 @@
 import { STATUS_META } from "../../lib/format";
 import { relativeTime } from "../../lib/format";
 import StatusPill from "../StatusPill";
+import { IconCheck } from "../icons";
 import { useNav } from "../../context/NavContext";
 
 export default function TaskRow({ task }) {
-  const { openTask, selectedHandle } = useNav();
+  const { openTask, selectedTask } = useNav();
   const meta = STATUS_META[task.status] ?? STATUS_META.queued;
-  const active = selectedHandle === task.handle;
+  // Composite identity, not handle alone -- two rows can legitimately
+  // share a handle (recycling), and only the row actually clicked should
+  // highlight (see NavContext).
+  const active = selectedTask?.handle === task.handle && selectedTask?.createdAt === task.created_at;
 
   return (
     <button
-      onClick={() => openTask(task.handle)}
+      onClick={() => openTask(task)}
       className={
         "flex w-full items-center gap-3 border-b border-[color:var(--color-hairline-soft)] px-4 py-3 text-left transition-colors " +
         (active ? "bg-[color:var(--color-accent-soft)]" : "hover:bg-[color:var(--color-surface)]")
@@ -38,6 +42,12 @@ export default function TaskRow({ task }) {
           </span>
         )}
         <StatusPill status={task.status} size="sm" />
+        {task.collected && (
+          <IconCheck
+            className="shrink-0 text-[color:var(--color-ink-faint)]"
+            title="Collected -- this handle has been released"
+          />
+        )}
         <span className="w-16 text-right font-mono-tabular text-xs text-[color:var(--color-ink-faint)]">
           {relativeTime(task.created_at)}
         </span>

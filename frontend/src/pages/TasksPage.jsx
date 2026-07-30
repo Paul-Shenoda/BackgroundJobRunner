@@ -7,7 +7,7 @@ import NewTaskSheet from "../components/tasks/NewTaskSheet";
 import { IconTasks } from "../components/icons";
 
 export default function TasksPage() {
-  const { selectedHandle, closeDetail } = useNav();
+  const { selectedTask, closeDetail } = useNav();
   const { isDesktop } = useBreakpoint();
 
   if (isDesktop) {
@@ -18,8 +18,8 @@ export default function TasksPage() {
           <TaskList />
         </div>
         <div className="min-h-0 flex-1">
-          {selectedHandle ? (
-            <TaskDetail handle={selectedHandle} />
+          {selectedTask ? (
+            <TaskDetail task={selectedTask} />
           ) : (
             <EmptyDetail />
           )}
@@ -31,10 +31,10 @@ export default function TasksPage() {
 
   // Tablet/phone: single pane. Detail is a full-screen push with a back
   // button rather than a second column -- 768px is too cramped for two.
-  if (selectedHandle) {
+  if (selectedTask) {
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <TaskDetail handle={selectedHandle} onBack={closeDetail} />
+        <TaskDetail task={selectedTask} onBack={closeDetail} />
         <NewTaskSheet />
       </div>
     );
