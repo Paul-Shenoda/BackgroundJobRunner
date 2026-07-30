@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getTaskDetail, cancelTask, retryTask, collectResult, ApiError } from "../lib/apiClient";
 import { useAuth } from "../context/AuthContext";
 import { useEventStream } from "../context/EventStreamContext";
+import { useTasks } from "../context/TasksContext";
 
 // Keeps a single task's detail live while a panel/screen has it open --
 // the brief's single best live-update demo (watching running -> ready
@@ -19,6 +20,7 @@ import { useEventStream } from "../context/EventStreamContext";
 export function useTaskDetail(handle, taskKey = handle) {
   const { apiKey } = useAuth();
   const { subscribe } = useEventStream();
+  const { refetch: refetchList } = useTasks();
   const [task, setTask] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -68,6 +70,15 @@ export function useTaskDetail(handle, taskKey = handle) {
       try {
         const updated = await fn(apiKey, handle);
         setTask((prev) => (prev ? { ...prev, ...updated } : updated));
+        // Collect and retry deliberately emit no SSE event (DECISIONS.md:
+        // `collected` is a flag, not a status transition; a retry emits
+        // nothing per the fixed 4-event contract) -- the list view's own
+        // refresh is entirely event-driven, so without this it would show
+        // stale data (e.g. a missing "collected" checkmark) until some
+        // UNRELATED event happened to trigger a refetch. Refreshing the
+        // list directly here closes that gap regardless of which action
+        // ran or whether the backend happens to broadcast it.
+        refetchList();
       } catch (err) {
         if (err instanceof ApiError && err.status === 409) {
           setActionError(err.detail || "That action isn't valid for this task right now.");
@@ -79,7 +90,7 @@ export function useTaskDetail(handle, taskKey = handle) {
         refetch();
       }
     },
-    [apiKey, handle, refetch]
+    [apiKey, handle, refetch, refetchList]
   );
 
   return {
