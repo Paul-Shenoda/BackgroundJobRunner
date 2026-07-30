@@ -2,7 +2,13 @@
 state history for each.
 
 Run as:
-    python -m scripts.seed [--reset] [--wipe] [--purge-debug-users]
+    python -m scripts.seed [--reset | --clear | --wipe] [--purge-debug-users]
+
+--reset, --clear, and --wipe are mutually exclusive -- each ends the seed
+data in a different state (reseeded / empty / gone-with-the-users), so
+combining them would just mean one silently overriding another. See each
+flag's --help text below for the exact distinction, particularly between
+--reset (clear then reseed) and --clear (clear and stop -- no reseed).
 
 A bare run only ever touches Alice's and Bob's own rows -- it never deletes
 another user. --purge-debug-users is the one opt-in exception: it previews
@@ -489,9 +495,22 @@ async def print_summary(conn: asyncpg.Connection) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reset", action="store_true", help="delete all seeded=true rows first")
-    parser.add_argument(
-        "--wipe", action="store_true", help="delete ALL rows (tasks and users), not just seed data"
+    # Mutually exclusive: each leaves seeded data in a different end state,
+    # so combining them would just mean one silently winning over another
+    # (an argparse error here is better than that silent ambiguity).
+    end_state = parser.add_mutually_exclusive_group()
+    end_state.add_argument(
+        "--reset", action="store_true", help="delete all seeded=true rows, then reseed fresh ones"
+    )
+    end_state.add_argument(
+        "--clear",
+        action="store_true",
+        help="delete all seeded=true rows and stop -- does NOT reseed afterward",
+    )
+    end_state.add_argument(
+        "--wipe",
+        action="store_true",
+        help="delete ALL rows (tasks and users), not just seed data, then reseed Alice/Bob",
     )
     parser.add_argument(
         "--purge-debug-users",
@@ -522,6 +541,11 @@ async def main() -> None:
             result = await conn.execute("DELETE FROM tasks WHERE seeded = true")
         print(f"Reset: {result}")
 
+    elif args.clear:
+        async with connection(DSN) as conn:
+            result = await conn.execute("DELETE FROM tasks WHERE seeded = true")
+        print(f"Cleared: {result}")
+
     # Opt-in only, and only when --wipe hasn't already deleted every user
     # (asking to confirm a purge of zero remaining users would be noise).
     # This deletes OTHER users' real, non-seed task data via their user_id
@@ -547,6 +571,15 @@ async def main() -> None:
                     await purge_debug_users(conn, candidates)
                 for row in candidates:
                     print(f"Removed {row['name']!r} ({row['api_key']})")
+
+    # --clear's whole point is to leave seed data absent -- unlike --reset
+    # and --wipe, which both fall through to the reseed below, --clear
+    # stops here. Placed after the --purge-debug-users block (not before
+    # it) so `--clear --purge-debug-users` together still runs both
+    # cleanup steps rather than the second one being silently skipped.
+    if args.clear:
+        print("Seeded rows removed. Run again without --clear to reseed.")
+        return
 
     alice_id = await ensure_user(DSN, ALICE_NAME, ALICE_KEY)
     bob_id = await ensure_user(DSN, BOB_NAME, BOB_KEY)

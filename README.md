@@ -220,17 +220,30 @@ they're not actually stuck.
 Flags:
 
 ```
-python -m scripts.seed --reset               # delete existing seeded rows first, then reseed
-python -m scripts.seed --wipe                # delete ALL rows (tasks + users), asks for confirmation
+python -m scripts.seed --reset               # delete existing seeded rows, then reseed fresh ones
+python -m scripts.seed --clear               # delete existing seeded rows and STOP -- no reseed
+python -m scripts.seed --wipe                # delete ALL rows (tasks + users), asks for confirmation, then reseeds
 python -m scripts.seed --purge-debug-users   # delete non-demo, non-test-fixture users; previews and asks first
 ```
 
+`--reset` and `--clear` both delete every `seeded = true` row — the
+difference is only what happens next. `--reset` reseeds immediately
+afterward, so you end up back where you started with a fresh batch (new
+timestamps, same shape). `--clear` stops right there, so you end up with
+*no* seed data at all — useful for a demo/recording where you want to
+show the dashboard against a clean slate, or against only your own real
+traffic, before seeding it back in later with a bare `python -m
+scripts.seed`. `--reset`, `--clear`, and `--wipe` are mutually exclusive
+(the script rejects combining them, rather than one silently winning).
+
 `--purge-debug-users` exists for cleaning up ad-hoc users left behind by
 manual testing (e.g. a one-off key created by hand while poking at the API).
-It is opt-in only — a bare run, and even `--reset`, never delete another
-user — and it always prints exactly who it found and how many tasks they
-have before asking for confirmation, since deleting a user cascades to their
-real (non-seed) task data too.
+It is opt-in only — a bare run, and even `--reset`/`--clear`, never delete
+another user — and it always prints exactly who it found and how many tasks
+they have before asking for confirmation, since deleting a user cascades to
+their real (non-seed) task data too. It can be combined with `--clear` (both
+are cleanup-only operations); combined with `--reset` or `--wipe`, both still
+run in the same order — the purge, then the reseed.
 
 ### Known issues
 
