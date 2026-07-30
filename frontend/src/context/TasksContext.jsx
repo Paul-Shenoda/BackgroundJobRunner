@@ -16,7 +16,7 @@ const PAGE_SIZE = 25;
 const REFRESH_DEBOUNCE_MS = 200;
 
 const DEFAULT_FILTERS = {
-  status: "",
+  status: [], // [] = "All"; a list of Status values otherwise (see FiltersBar)
   lane: "",
   createdAfter: "",
   createdBefore: "",

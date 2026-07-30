@@ -17,7 +17,11 @@ export default function TaskRow({ task }) {
       onClick={() => openTask(task)}
       className={
         "flex w-full items-center gap-3 border-b border-[color:var(--color-hairline-soft)] px-4 py-3 text-left transition-colors " +
-        (active ? "bg-[color:var(--color-accent-soft)]" : "hover:bg-[color:var(--color-surface)]")
+        (active ? "bg-[color:var(--color-accent-soft)]" : "hover:bg-[color:var(--color-surface)]") +
+        // Collected rows are done and acknowledged -- ranked below active
+        // work visually (reduced opacity), not hidden. hover:opacity-100
+        // restores full weight while actually looking at one.
+        (task.collected ? " opacity-70 hover:opacity-100" : "")
       }
       style={{ borderLeft: `3px solid ${meta.color}` }}
     >

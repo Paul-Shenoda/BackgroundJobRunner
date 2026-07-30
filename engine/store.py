@@ -237,7 +237,7 @@ class Store:
     async def list_tasks(
         self,
         user_id: uuid.UUID,
-        status: Status | None = None,
+        status: Status | list[Status] | None = None,
         lane: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
@@ -251,6 +251,12 @@ class Store:
         as $N placeholders; only fixed column names/operators are
         interpolated into the query text.
 
+        status accepts either one Status or a list (the dashboard's quick
+        filters -- "Active" is queued+running, "Completed" is
+        ready+failed+cancelled -- need an OR-of-statuses in one query, not
+        one call per status). A single value uses `=`; a list uses
+        `= ANY($N::task_status[])`, both bound, never interpolated.
+
         sort_by/sort_order are validated against a fixed allowlist before
         interpolation (never bindable as query params) — the same rule
         applied to every other fixed column/operator in this method."""
@@ -262,7 +268,11 @@ class Store:
         conditions = ["user_id = $1"]
         params: list[Any] = [user_id]
 
-        if status is not None:
+        if isinstance(status, list):
+            if status:
+                params.append([s.value for s in status])
+                conditions.append(f"status = ANY(${len(params)}::task_status[])")
+        elif status is not None:
             params.append(status.value)
             conditions.append(f"status = ${len(params)}")
         if lane is not None:

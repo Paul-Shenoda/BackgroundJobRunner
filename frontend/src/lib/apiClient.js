@@ -24,7 +24,14 @@ async function request(path, { method = "GET", apiKey, params, body, signal } = 
   const url = new URL(path, window.location.origin);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null && value !== "") {
+      if (value === undefined || value === null || value === "") continue;
+      if (Array.isArray(value)) {
+        // Repeated params (?status=queued&status=running), not a single
+        // comma-joined value -- matches api/routes.py's Query(None)
+        // collection, and is the standard REST convention for a
+        // multi-value filter.
+        for (const v of value) url.searchParams.append(key, v);
+      } else {
         url.searchParams.set(key, value);
       }
     }

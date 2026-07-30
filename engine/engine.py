@@ -191,7 +191,7 @@ class Engine:
     async def list_tasks(
         self,
         user_id: uuid.UUID,
-        status: Optional[Status] = None,
+        status: Optional[Status | list[Status]] = None,
         lane: Optional[str] = None,
         created_after: Optional[datetime] = None,
         created_before: Optional[datetime] = None,

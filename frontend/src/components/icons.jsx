@@ -62,6 +62,22 @@ export function IconCheck(props) {
   );
 }
 
+export function IconFilter(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" {...base} {...props}>
+      <path d="M4 5h16M7 12h10M10 19h4" />
+    </svg>
+  );
+}
+
+export function IconSort(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" {...base} {...props}>
+      <path d="M7 4v16M7 4l-3 3M7 4l3 3M17 20V4M17 20l-3-3M17 20l3-3" />
+    </svg>
+  );
+}
+
 export function IconAlert(props) {
   return (
     <svg viewBox="0 0 24 24" width="18" height="18" {...base} {...props}>

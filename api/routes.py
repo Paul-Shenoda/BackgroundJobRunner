@@ -10,7 +10,7 @@ api/main.py's exception handlers) — never from a handler re-deriving
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.auth import get_current_user_id
 from api.schemas import SubmitRequest
@@ -58,7 +58,7 @@ _SORT_ORDERS = {"asc", "desc"}
 
 @router.get("/tasks")
 async def list_tasks(
-    status: str | None = None,
+    status: list[str] | None = Query(None),
     lane: str | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
@@ -69,7 +69,12 @@ async def list_tasks(
     user_id: uuid.UUID = Depends(get_current_user_id),
     engine: Engine = Depends(get_engine),
 ):
-    status_enum = _parse_status(status) if status is not None else None
+    # Repeated ?status= params (e.g. ?status=queued&status=running), not a
+    # new param name -- the dashboard's "Active"/"Completed" quick filters
+    # are each an OR of statuses, and this is the standard REST convention
+    # for a multi-value query filter. A single ?status=ready still works
+    # unchanged (Query(None) collects it into a one-item list).
+    status_list = [_parse_status(s) for s in status] if status else None
     if lane is not None and lane not in engine.lanes():
         raise HTTPException(status_code=400, detail=f"unknown lane {lane!r}")
     if sort_by not in _SORT_COLUMNS:
@@ -85,7 +90,7 @@ async def list_tasks(
 
     tasks = await engine.list_tasks(
         user_id,
-        status=status_enum,
+        status=status_list,
         lane=lane,
         created_after=created_after,
         created_before=created_before,
