@@ -66,15 +66,34 @@ class Engine:
     """Composes Store, WorkerRegistry, EventBus, and WorkerPool. Callers
     configure it once and never touch those four objects directly."""
 
+    # Rule of thumb (document, don't just remember): lease_seconds should be
+    # at least 4-5x heartbeat_interval in practice, giving several renewal
+    # opportunities and a wide safety margin per lease. The constructor below
+    # enforces a hard floor of 3x — below that, a single ordinary scheduling
+    # delay (GC pause, event-loop contention, a loaded box) can make a
+    # perfectly live worker look dead, which was never the intent of the
+    # crash-requeue tradeoff (see DECISIONS.md, "lease-to-heartbeat ratio
+    # must leave room for several missed renewals").
+    MIN_LEASE_TO_HEARTBEAT_RATIO = 3
+
     def __init__(
         self,
         dsn: str,
         concurrency: int = 2,
-        lease_seconds: int = 30,
+        lease_seconds: int = 50,
         heartbeat_interval: int = 10,
         max_attempts: int = 3,
         poll_interval: float = 0.5,
     ) -> None:
+        if lease_seconds < self.MIN_LEASE_TO_HEARTBEAT_RATIO * heartbeat_interval:
+            raise ValueError(
+                f"lease_seconds ({lease_seconds}) must be at least "
+                f"{self.MIN_LEASE_TO_HEARTBEAT_RATIO}x heartbeat_interval "
+                f"({heartbeat_interval}) — otherwise a heartbeat has no realistic "
+                f"chance to renew the lease before it expires, and an ordinary "
+                f"scheduling delay becomes indistinguishable from a dead worker. "
+                f"Recommended: 4-5x for real headroom, not just the bare minimum."
+            )
         self._dsn = dsn
         self._max_attempts = max_attempts
         self._concurrency = concurrency

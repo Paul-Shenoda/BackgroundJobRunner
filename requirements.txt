@@ -6,3 +6,4 @@ python-dotenv
 pytest
 pytest-asyncio
 httpx
+asgi-lifespan

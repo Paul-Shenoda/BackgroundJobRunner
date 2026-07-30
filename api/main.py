@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
         dsn,
         concurrency=int(os.environ.get("CONCURRENCY_LIMIT", 2)),
         lease_seconds=int(os.environ.get("LEASE_SECONDS", 30)),
+        heartbeat_interval=int(os.environ.get("HEARTBEAT_INTERVAL", 10)),
         max_attempts=int(os.environ.get("MAX_ATTEMPTS", 3)),
     )
     engine.register_worker("scrape", mock_worker)

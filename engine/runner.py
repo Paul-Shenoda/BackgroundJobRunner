@@ -34,11 +34,17 @@ class WorkerPool:
         registry: WorkerRegistry,
         event_bus: EventBus,
         concurrency: int = 2,
-        lease_seconds: int = 30,
+        lease_seconds: int = 50,
         heartbeat_interval: int = 10,
         max_attempts: int = 3,
         poll_interval: float = 0.5,
     ) -> None:
+        # Mirrors Engine.MIN_LEASE_TO_HEARTBEAT_RATIO's default ratio (5x)
+        # for consistency's sake, but the enforced invariant itself lives
+        # only on Engine.__init__ — this class is internal-only (see
+        # engine.py's module docstring: Engine is the sole public entry
+        # point under engine/), so it's Engine's job to validate, not this
+        # one's to duplicate that check.
         self._store = store
         self._registry = registry
         self._event_bus = event_bus

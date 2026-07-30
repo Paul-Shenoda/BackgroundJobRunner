@@ -346,12 +346,25 @@ async def scenario_i(engine, user_id, track, event_log, dsn):
     await wait_for_task(engine, user_id, reused.handle, reused.id, {Status.READY, Status.FAILED}, timeout=10)
 
 
+async def _force_lease_into_the_past(dsn: str, task_id) -> None:
+    """Script-level housekeeping, not engine business logic — same category
+    as cleanup() below, and CLAUDE.md's asyncpg-confinement rule scopes to
+    engine/, not to this script (see scripts/bootstrap.py's module
+    docstring). Used only to simulate "this lease is already expired"
+    without waiting lease_seconds out for real."""
+    async with connection(dsn) as conn:
+        await conn.execute(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+            task_id,
+        )
+
+
 async def scenario_j_poison_job(engine, user_id, track, event_log, dsn):
-    """Forces a lease to expire twice before any heartbeat can renew it,
-    proving reap_expired_leases's poison-job protection actually terminates
-    the task (both the requeue AND the exhaustion branch) instead of
-    cycling it forever. This was the exact gap code review caught — nothing
-    else in this script exercises the reap-to-failed path.
+    """Forces a lease to expire twice before it's ever renewed, proving
+    reap_expired_leases's poison-job protection actually terminates the
+    task (both the requeue AND the exhaustion branch) instead of cycling it
+    forever. This was the exact gap code review caught — nothing else in
+    this script exercises the reap-to-failed path.
 
     max_attempts=2 (not 1): with 1, the very first lease expiry is already
     exhaustion, so the CASE WHEN's requeue branch never runs — the scenario
@@ -359,21 +372,34 @@ async def scenario_j_poison_job(engine, user_id, track, event_log, dsn):
     first expiry requeues (attempts=1<2) and the second exhausts
     (attempts=2>=2), proving both branches in one run.
 
-    concurrency=2 (not 1) so the second reclaim doesn't have to wait for
-    the first attempt's worker to naturally finish before it can even be
-    claimed — keeps this fast (~3-4s) regardless of duration_ms.
+    Historical note: this used to force expiry by constructing a temporary
+    Engine with heartbeat_interval=100 and lease_seconds=1 — a heartbeat
+    that could never possibly win the race against its own lease. That's no
+    longer possible: Engine's constructor now enforces
+    lease_seconds >= MIN_LEASE_TO_HEARTBEAT_RATIO * heartbeat_interval,
+    specifically BECAUSE a ratio that thin is indistinguishable from the
+    real misconfiguration that once let a genuinely live worker get
+    declared dead after a single delayed heartbeat (see DECISIONS.md,
+    "lease-to-heartbeat ratio must leave room for several missed
+    renewals"). `poison` below uses a comfortably valid ratio (5x) instead,
+    and expiry is forced directly via one UPDATE on lease_expires_at —
+    housekeeping via the same script-level DB escape hatch cleanup() uses,
+    not a construction-time hack.
 
-    duration_ms=10000 is deliberately far longer than this scenario's own
-    runtime, not arbitrary: heartbeat_interval=100 guarantees neither
-    attempt's worker ever notices its lease was reclaimed, so both keep
-    sleeping in the background the whole time. If either woke up and called
-    mark_ready while the row happened to be 'running' again (a fresh
-    claim), its stale WHERE status='running' could match and corrupt the
-    result. Making duration_ms far outlast the scenario means neither
-    worker wakes up during the test at all — the row's terminal 'failed'
-    state comes entirely from the reaper's own direct UPDATE, never from a
-    worker's outcome. Both orphaned workers get cleanly cancelled by
-    poison.stop() once the assertions are done.
+    Sequence per attempt: wait for the claim to land (status='running'),
+    THEN stop the pool. stop() cancels the in-flight worker task AND its
+    heartbeat loop and awaits their cancellation before returning (see
+    WorkerPool.stop) — so by the time control returns here, nothing will
+    ever renew this lease again, exactly as a real SIGKILL would leave
+    things. Only then is lease_expires_at forced into the past and the pool
+    restarted, so the forced expiry can never race a still-live heartbeat
+    that might otherwise renew it first.
+
+    concurrency=2 (not 1) so this reclaim doesn't have to wait on anything
+    else — keeps this fast regardless of duration_ms. duration_ms=10000 is
+    deliberately far longer than this scenario's own runtime so neither
+    claim's worker ever wakes up and calls mark_ready mid-scenario; both
+    orphaned workers get cleanly cancelled by poison.stop() along the way.
 
     claim_next has no per-pool scoping (see DECISIONS.md) — it claims the
     oldest eligible 'queued' row globally, regardless of which WorkerPool
@@ -383,13 +409,29 @@ async def scenario_j_poison_job(engine, user_id, track, event_log, dsn):
     """
     await engine.stop()
     try:
-        poison = Engine(dsn=dsn, concurrency=2, lease_seconds=1,
-                         heartbeat_interval=100, max_attempts=2)
+        poison = Engine(dsn=dsn, concurrency=2, lease_seconds=5,
+                         heartbeat_interval=1, max_attempts=2)
         poison.register_worker("scrape", mock_worker)
         await poison.start()
         try:
             task = await poison.submit(user_id, "scrape", {"duration_ms": 10000})
             track(task)
+
+            # First claim: attempts 0 -> 1, genuinely running. Force its
+            # lease to expire; boot recovery requeues it (1 < max_attempts).
+            await wait_for_task(poison, user_id, task.handle, task.id, {Status.RUNNING}, timeout=10)
+            await poison.stop()
+            await _force_lease_into_the_past(dsn, task.id)
+            await poison.start()
+
+            # Second claim: attempts 1 -> 2, genuinely running again. Force
+            # expiry again; boot recovery this time finds attempts >=
+            # max_attempts and fails it directly, without a third claim.
+            await wait_for_task(poison, user_id, task.handle, task.id, {Status.RUNNING}, timeout=10)
+            await poison.stop()
+            await _force_lease_into_the_past(dsn, task.id)
+            await poison.start()
+
             final = await wait_for_task(poison, user_id, task.handle, task.id,
                                          {Status.FAILED}, timeout=15)
             assert final.attempts == 2, f"expected 2 attempts (max_attempts=2), got {final.attempts}"
