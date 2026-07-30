@@ -20,8 +20,10 @@ export default function TaskRow({ task }) {
         (active ? "bg-[color:var(--color-accent-soft)]" : "hover:bg-[color:var(--color-surface)]") +
         // Collected rows are done and acknowledged -- ranked below active
         // work visually (reduced opacity), not hidden. hover:opacity-100
-        // restores full weight while actually looking at one.
-        (task.collected ? " opacity-70 hover:opacity-100" : "")
+        // restores full weight while actually looking at one. 50%, not
+        // 70% -- asked to make this stand out more after the first pass
+        // read as too subtle at a glance.
+        (task.collected ? " opacity-50 hover:opacity-100" : "")
       }
       style={{ borderLeft: `3px solid ${meta.color}` }}
     >

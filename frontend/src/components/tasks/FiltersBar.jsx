@@ -163,7 +163,15 @@ function FiltersPopoverContent({ onClose }) {
   }
 
   return (
-    <div className="flex w-72 flex-col gap-4 rounded-xl border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] p-4 shadow-xl shadow-black/20">
+    // w-[350px], not w-72 (288px): measured precisely (Playwright) that two
+    // native <input type=date> elements have an intrinsic width of 130px
+    // each that browsers won't shrink below gracefully -- below that, the
+    // calendar icon gets clipped rather than the input shrinking further.
+    // 288px was 33px short of what the unshrunk row actually needed. 350px
+    // gives ~22px of real slack over the measured need, while still
+    // comfortably fitting inside the popover's own boundary clamp (see
+    // Popover.jsx) at the narrowest real case (390px phone).
+    <div className="flex w-[350px] flex-col gap-4 rounded-xl border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] p-4 shadow-xl shadow-black/20">
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-ink-faint)]">
           Filters
@@ -220,18 +228,24 @@ function FiltersPopoverContent({ onClose }) {
       <div className="flex flex-col gap-1.5 text-xs text-[color:var(--color-ink-dim)]">
         Created between
         <div className="flex items-center gap-2">
+          {/* No flex-1: a native date input has an intrinsic ~130px width
+              it won't shrink below without clipping its own calendar
+              icon (measured directly, not assumed) -- shrink-0 keeps
+              both inputs at that natural size regardless of how much
+              room the row has, rather than fighting the browser to
+              compress them further. */}
           <input
             type="date"
             value={filters.createdAfter}
             onChange={(e) => setFilters({ createdAfter: e.target.value })}
-            className={selectClass + " flex-1"}
+            className={selectClass + " shrink-0"}
           />
           <span className="text-[color:var(--color-ink-faint)]">to</span>
           <input
             type="date"
             value={filters.createdBefore}
             onChange={(e) => setFilters({ createdBefore: e.target.value })}
-            className={selectClass + " flex-1"}
+            className={selectClass + " shrink-0"}
           />
         </div>
       </div>
