@@ -1,6 +1,8 @@
 """Handle allocation and recycling — the most scrutinised behaviour in the
 brief, verified here purely through what the API exposes."""
 
+import asyncio
+
 from tests.helpers import cancel_and_confirm, submit, wait_for_status
 
 
@@ -82,6 +84,48 @@ async def test_handle_recycles_after_collecting_a_failure(client_a):
         f"got {reused['handle']!r} — handle-holding must depend on `collected`, not outcome"
     )
     await wait_for_status(client_a, "scrape-1", {"ready", "failed"}, reused["created_at"], timeout=10)
+
+
+async def test_concurrent_submits_same_lane_get_distinct_handles(client_a):
+    """Criterion 4's concurrent half: N simultaneous submissions to ONE lane
+    must every one succeed with a distinct handle — no duplicates (the
+    partial unique index holding under a race) and no allocation give-ups
+    (the retry budget + jittered backoff absorbing the burst; a budget of 5
+    with no backoff demonstrably returned 503s at just 6 concurrent).
+
+    Uses raw client.post rather than helpers.submit so a non-202 shows up
+    as a counted failure with its body, not an assert buried mid-gather.
+    """
+    n = 20
+    responses = await asyncio.gather(
+        *[
+            client_a.post(
+                "/tasks", json={"lane": "scrape", "params": {"duration_ms": 8000}}
+            )
+            for _ in range(n)
+        ]
+    )
+
+    failures = [(r.status_code, r.text) for r in responses if r.status_code != 202]
+    assert not failures, f"{len(failures)} of {n} concurrent submits failed: {failures}"
+
+    tasks = [r.json() for r in responses]
+    handles = [t["handle"] for t in tasks]
+    assert len(set(handles)) == n, (
+        f"expected {n} distinct handles, got {len(set(handles))} — duplicates: "
+        f"{sorted(h for h in set(handles) if handles.count(h) > 1)}"
+    )
+    # Starting from this test's clean slate, lowest-free allocation must
+    # yield exactly scrape-1..scrape-N — any gap or overshoot means an
+    # allocator lost a race and then skipped a free number.
+    assert set(handles) == {f"scrape-{i}" for i in range(1, n + 1)}
+
+    # Confirmed-terminal cleanup (see conftest._clean_slate's docstring):
+    # the fixture deletes rows but cannot stop a live asyncio job, and 20
+    # abandoned 8s jobs would occupy the shared pool's slots for whatever
+    # test runs next.
+    for t in tasks:
+        await cancel_and_confirm(client_a, t["handle"], t["created_at"])
 
 
 async def test_cancelled_handle_is_immediately_reusable(client_a):

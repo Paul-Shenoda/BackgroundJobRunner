@@ -145,7 +145,7 @@ Workers return `ready` or `failed` **only**. They know nothing about `queued`, `
 
 ## Behaviour rules
 
-**Handles.** `lane-N`, numbered per lane per user. A number is held while the job is `queued`, `running`, or finished-but-uncollected. Released on collect (success *or* failure) or on cancel. Allocation: compute lowest free number → INSERT → on unique violation, recompute and retry (up to 5 times).
+**Handles.** `lane-N`, numbered per lane per user. A number is held while the job is `queued`, `running`, or finished-but-uncollected. Released on collect (success *or* failure) or on cancel. Allocation: compute lowest free number → INSERT → on unique violation, recompute and retry with jittered backoff (up to 25 times — a budget of 5 demonstrably 503'd at just 6 concurrent submits to one lane).
 
 **Retries.** Max 3 attempts. Retryable failure with budget remaining → back to `queued` with `not_before = now + backoff` (exponential: 1s, 2s, 4s). Attempts exhausted → `failed` with `retryable: false`. Non-retryable failure → `failed` immediately, no retry. A lease-expiry requeue **does** consume an attempt (poison-job protection).
 
