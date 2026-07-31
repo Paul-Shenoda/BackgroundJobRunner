@@ -45,7 +45,7 @@ async def _event_stream(engine: Engine, user_id: uuid.UUID):
     changed just now," never "here's what you missed."
     """
     queue = engine.subscribe(user_id)
-    logger.debug("SSE subscribe user_id=%s", user_id)
+    logger.info("SSE subscribe user_id=%s", user_id)
     try:
         while True:
             try:
@@ -73,7 +73,7 @@ async def _event_stream(engine: Engine, user_id: uuid.UUID):
         # constantly (tab close, sleep, network change), so this leak
         # would be steady, not rare.
         engine.unsubscribe(user_id, queue)
-        logger.debug("SSE unsubscribe user_id=%s", user_id)
+        logger.info("SSE unsubscribe user_id=%s", user_id)
 
 
 @router.get("/events")

@@ -159,6 +159,11 @@ class WorkerPool:
                     await asyncio.sleep(self._poll_interval)
                     continue
 
+                logger.info(
+                    "dispatch: claimed task %s (lane=%s, attempt=%d)",
+                    task.handle, task.lane, task.attempts,
+                )
+
                 if not self._registry.has(task.lane):
                     await self._fail_unknown_lane(task)
                     continue

@@ -7,6 +7,7 @@ scripts/bootstrap.py's connection() helper instead, which is deliberately
 outside engine/ (DECISIONS.md, "Engine as a standalone module").
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +31,23 @@ from engine.engine import (
 from engine.workers.mock import mock_worker
 
 load_dotenv()
+
+# uvicorn configures its own "uvicorn"/"uvicorn.access"/"uvicorn.error"
+# loggers (each with propagate=False and its own handler) before this module
+# is even imported -- Config.__init__ calls configure_logging() ahead of
+# load_app(). Its default LOGGING_CONFIG never touches the root logger or
+# sets disable_existing_loggers=True, so configuring the root logger here
+# doesn't fight it or get clobbered by it: engine/ and api/'s loggers (all
+# plain logging.getLogger(__name__), propagate=True, no level of their own)
+# inherit whatever level the root logger has. Without this call the root
+# logger sits at the logging-module default of WARNING with no handler, so
+# every logger.info/debug in engine/runner.py and api/events.py -- the
+# reaper's reclaim line, dispatch claims, SSE subscribe/unsubscribe -- is
+# computed and then silently discarded.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager

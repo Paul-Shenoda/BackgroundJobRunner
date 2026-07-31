@@ -144,6 +144,19 @@ The reaper runs on boot **and** on a timer — boot-only recovery would miss a w
 
 ## Setup & Running Locally
 
+### Environment variables
+
+All read from `.env` (see `.env.example`) via `python-dotenv`:
+
+| Variable            | Default | Purpose                                                        |
+|---------------------|---------|-----------------------------------------------------------------|
+| `DATABASE_URL`      | —       | Postgres DSN, `postgresql://user:pass@host:port/db`             |
+| `CONCURRENCY_LIMIT`  | `2`     | Max tasks running at once, this process                        |
+| `LEASE_SECONDS`      | `30`    | How long a claimed task's lease lives before the reaper reclaims it |
+| `HEARTBEAT_INTERVAL` | `10`    | How often a running task's lease is renewed                    |
+| `MAX_ATTEMPTS`       | `3`     | Attempts (including the first) before a retryable failure gives up |
+| `LOG_LEVEL`          | `INFO`  | Root logger level — `DEBUG` for verbose per-poll dispatch noise, `INFO` to see claims, retries, cancellations, and reaper reclaims without the noise |
+
 ### Database schema
 
 `sql/schema.sql` is the single source of truth for the database, applied by
