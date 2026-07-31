@@ -64,8 +64,12 @@ async def list_tasks(
     created_before: datetime | None = None,
     sort_by: str = "created_at",
     sort_order: str = "desc",
-    limit: int = 50,
-    offset: int = 0,
+    # Bounded, not bare ints: a negative value would flow straight into the
+    # SQL LIMIT/OFFSET and surface as an asyncpg error -> 500 (observed:
+    # ?limit=-1), and an uncapped limit is an unbounded response size.
+    # ge/le make out-of-range values an honest 422 instead.
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     user_id: uuid.UUID = Depends(get_current_user_id),
     engine: Engine = Depends(get_engine),
 ):

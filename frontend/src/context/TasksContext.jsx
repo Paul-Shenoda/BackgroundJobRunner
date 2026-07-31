@@ -13,6 +13,11 @@ import { useEventStream } from "./EventStreamContext";
 
 const TasksContext = createContext(null);
 const PAGE_SIZE = 25;
+// Mirrors GET /tasks' server-side bound (api/routes.py: limit le=200).
+// Growing past it would turn every subsequent fetch into a 422 and put the
+// whole list into its error state; clamping here means a very deep list
+// simply stops offering "Load more" at the cap instead.
+const API_MAX_LIMIT = 200;
 const REFRESH_DEBOUNCE_MS = 200;
 
 const DEFAULT_FILTERS = {
@@ -51,7 +56,7 @@ export function TasksProvider({ children }) {
         const result = await listTasks(apiKey, { ...filters, limit: count, offset: 0 });
         if (requestId !== requestIdRef.current) return; // superseded by a newer fetch
         setTasks(result);
-        setHasMore(result.length >= count);
+        setHasMore(result.length >= count && count < API_MAX_LIMIT);
         setError(null);
       } catch (err) {
         if (requestId !== requestIdRef.current) return;
@@ -95,7 +100,7 @@ export function TasksProvider({ children }) {
   }, []);
 
   const loadMore = useCallback(() => {
-    countRef.current += PAGE_SIZE;
+    countRef.current = Math.min(countRef.current + PAGE_SIZE, API_MAX_LIMIT);
     runFetch(countRef.current);
   }, [runFetch]);
 

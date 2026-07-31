@@ -386,17 +386,17 @@ async def test_backoff_survives_restart(restart_user_id: uuid.UUID) -> None:
 
 async def test_no_duplicate_execution_after_restart(restart_user_id: uuid.UUID) -> None:
     """A task killed mid-run must resume to exactly one terminal outcome,
-    never two. The API never exposes an internal `attempts` count (CLAUDE.md
-    fixes the task object to exactly nine fields; there is no detail-view
-    route in api/routes.py to read it from either) — see the finding at the
-    bottom of this file's docstring-adjacent commentary reported alongside
-    the test results. What IS observable, and is the actual externally-
-    visible symptom a genuine duplicate-execution bug would produce, is a
-    result flip-flopping or a status regressing after first reaching
-    terminal: mark_ready/mark_failed's `WHERE status = 'running'` guard
-    (store.py) means only the FIRST writer of a race can ever stick, so a
-    second, orphaned execution finishing later has no way to overwrite it —
-    this test proves that from outside the process, not from re-reading the
+    never two. GET /tasks/{handle} does expose `attempts` (a documented
+    detail-endpoint extra on top of the nine contract fields), but an
+    attempts count can't distinguish "claimed twice, resolved once"
+    (correct crash recovery) from "resolved twice" (the actual bug) — both
+    read 2. What CAN distinguish them, and is the externally-visible
+    symptom a genuine duplicate-execution bug would produce, is a result
+    flip-flopping or a status regressing after first reaching terminal:
+    mark_ready/mark_failed's `WHERE status = 'running'` guard (store.py)
+    means only the FIRST writer of a race can ever stick, so a second,
+    orphaned execution finishing later has no way to overwrite it — this
+    test proves that from outside the process, not from re-reading the
     guarantee's source.
     """
     proc1 = APIProcess(DSN)

@@ -28,7 +28,15 @@ async def test_concurrency_limit_respected(client_a):
     else:
         raise AssertionError("not all 5 tasks reached a terminal state within 20s")
 
-    assert max_running >= 1, "never observed anything running — the pool did not dispatch at all"
+    # >= 2, not >= 1: the limit must actually be REACHED, not merely never
+    # exceeded — a pool hardcoded to concurrency 1 would sail through the
+    # <= 2 assertions above and prove nothing about parallelism. With 5
+    # queued 1.5s jobs and a 0.2s poll, both slots being full is observable
+    # on many consecutive polls, so this is not a timing-lottery assertion.
+    assert max_running >= 2, (
+        f"never observed both slots in use (max seen: {max_running}) — the pool "
+        f"is not actually running 2 jobs in parallel"
+    )
 
 
 async def test_concurrent_completions_all_land(client_a):
