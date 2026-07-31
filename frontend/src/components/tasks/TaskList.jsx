@@ -37,18 +37,41 @@ export default function TaskList() {
   }
 
   // Handles recycle (CLAUDE.md), so the visible list can contain several
-  // rows sharing one handle string -- at most one of them active (the
-  // partial unique index guarantees that), the rest historical. Adjacent
-  // duplicates LOOK like the exact collision the brief forbids, so the
-  // historical ones get an explicit "recycled" marker. "Holds the handle"
-  // mirrors uniq_active_handle's predicate: queued/running, or
-  // ready/failed and not yet collected.
-  const handleCounts = new Map();
-  for (const t of tasks) handleCounts.set(t.handle, (handleCounts.get(t.handle) ?? 0) + 1);
+  // rows sharing one handle string -- historical duplicates piling up
+  // under a number the partial unique index has since let go. Exactly
+  // ONE row per handle is ever "the one GET /tasks/{handle} resolves to"
+  // right now -- mirroring store.py's get_task ORDER BY exactly: an
+  // active row (queued/running, or ready/failed and uncollected) wins if
+  // one exists; otherwise the most recently created row wins. Every
+  // OTHER row sharing that handle is what actually gets the "recycled"
+  // marker.
+  //
+  // Getting this wrong bit for real: an earlier version treated "not
+  // currently active" as the recycled test, which is right while one
+  // copy is still active but wrong once ALL copies of a handle are
+  // collected -- with no active row, every terminal duplicate looked
+  // equally "not active" and got marked recycled, including the one the
+  // API would actually still resolve to (and reference in a click's own
+  // detail fetch). created_at is the same disambiguator TaskDetail.jsx's
+  // recycled check already uses, specifically so the list marker and the
+  // detail banner can never disagree about which row is canonical.
   const holdsHandle = (t) =>
     t.status === "queued" ||
     t.status === "running" ||
     ((t.status === "ready" || t.status === "failed") && !t.collected);
+
+  const byHandle = new Map();
+  for (const t of tasks) {
+    if (!byHandle.has(t.handle)) byHandle.set(t.handle, []);
+    byHandle.get(t.handle).push(t);
+  }
+  const canonicalCreatedAt = new Map();
+  for (const [handle, rows] of byHandle) {
+    if (rows.length < 2) continue; // unique handle -- nothing to disambiguate
+    const active = rows.find(holdsHandle);
+    const canonical = active ?? rows.reduce((latest, t) => (t.created_at > latest.created_at ? t : latest));
+    canonicalCreatedAt.set(handle, canonical.created_at);
+  }
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -62,7 +85,7 @@ export default function TaskList() {
         <TaskRow
           key={`${task.handle}-${task.created_at}`}
           task={task}
-          recycled={handleCounts.get(task.handle) > 1 && !holdsHandle(task)}
+          recycled={canonicalCreatedAt.has(task.handle) && canonicalCreatedAt.get(task.handle) !== task.created_at}
         />
       ))}
       {hasMore && (
