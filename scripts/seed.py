@@ -575,6 +575,22 @@ async def main() -> None:
         print("Seeded rows removed. Run again without --clear to reseed.")
         return
 
+    # --purge-debug-users alone is cleanup-only, same framing as --clear's
+    # early return just above -- it must NOT fall through to the reseed
+    # below unless --reset or --wipe was ALSO given. Without this check, a
+    # bare `--purge-debug-users` run against an already-seeded database
+    # fell through to insert_tasks, which is not idempotent (see
+    # DECISIONS.md, "Rows are inserted directly via SQL... a bare
+    # `python -m scripts.seed` must never reach this path" -- true of the
+    # purge case too, not just plain bare runs) and collided with the
+    # uniq_active_handle constraint on Alice/Bob's already-active rows
+    # instead of failing informatively. --reset/--wipe both already clear
+    # (or wipe) the slate before this point, so those combinations still
+    # fall through and reseed correctly.
+    if args.purge_debug_users and not args.reset and not args.wipe:
+        print("Purge-only run (no --reset/--wipe given) -- Alice/Bob's data left as-is.")
+        return
+
     alice_id = await ensure_user(DSN, ALICE_NAME, ALICE_KEY)
     bob_id = await ensure_user(DSN, BOB_NAME, BOB_KEY)
 

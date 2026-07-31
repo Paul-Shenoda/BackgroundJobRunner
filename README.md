@@ -8,6 +8,7 @@ Submit a job over a REST API and get a short handle back before it runs; work ex
 
 **Live:** https://job-runner-app.mangobush-0fc2a290.eastus.azurecontainerapps.io
 **Demo keys:** `X-API-Key: alice-demo-key` / `X-API-Key: bob-demo-key`
+**Want your own key instead of sharing the demo ones?** `python -m scripts.provision_user "Your Name"` — see [Provisioning a real user's API key](#provisioning-a-real-users-api-key).
 
 **Contents:** [Codespaces](#quickstart--github-codespaces) · [Local setup](#quickstart--local) · [API Reference](#api-reference) · [Tests](#running-the-tests) · [Seeding](#seeding) · [Frontend](#frontend) · [Architecture](#architecture) · [Deployment](#deployment) · [Decisions & Tradeoffs](#decisions--tradeoffs) · [What I'd Do Next](#what-id-do-next)
 
@@ -253,13 +254,17 @@ scripts.seed`. `--reset`, `--clear`, and `--wipe` are mutually exclusive
 (the script rejects combining them, rather than one silently winning).
 
 `--purge-debug-users` exists for cleaning up ad-hoc users left behind by
-manual testing (e.g. a one-off key created by hand while poking at the API).
-It is opt-in only — a bare run, and even `--reset`/`--clear`, never delete
-another user — and it always prints exactly who it found and how many tasks
-they have before asking for confirmation, since deleting a user cascades to
-their real (non-seed) task data too. It can be combined with `--clear` (both
-are cleanup-only operations); combined with `--reset` or `--wipe`, both still
-run in the same order — the purge, then the reseed.
+manual testing (e.g. a one-off key created by hand while poking at the API,
+or via `scripts/provision_user.py`). It is opt-in only — a bare run, and
+even `--reset`/`--clear`, never delete another user — and it always prints
+exactly who it found and how many tasks they have before asking for
+confirmation, since deleting a user cascades to their real (non-seed) task
+data too. Used alone (or with `--clear`), it's cleanup-only and stops
+there — it does **not** fall through to a reseed, since `insert_tasks`
+isn't idempotent (see above) and would collide with Alice/Bob's own
+already-active rows on anything but an empty database. Combined with
+`--reset` or `--wipe`, both still run in the same order — the purge, then
+the reseed — since those two already clear (or wipe) the slate first.
 
 ### Provisioning a real user's API key
 
@@ -274,24 +279,32 @@ the API's own seeded users at startup, the pytest fixtures — goes through
 the same idempotent function: `scripts.bootstrap.ensure_user(dsn, name,
 api_key)`. It's `INSERT ... ON CONFLICT (api_key) DO UPDATE ... RETURNING
 id` — safe to run again with the same key, and the only place a user row
-gets created. There's no CLI wrapper around it (nothing here needed one
-until this point), so an operator provisioning a new real user runs it
-directly:
+gets created. `scripts/provision_user.py` is the CLI wrapper around it:
 
 ```
-python -c "
-import asyncio, os
-from dotenv import load_dotenv
-from scripts.bootstrap import ensure_user
-
-load_dotenv()
-user_id = asyncio.run(ensure_user(os.environ['DATABASE_URL'], 'Carol', 'carol-prod-key'))
-print(f'user_id={user_id}')
-"
+python -m scripts.provision_user "Carol"
 ```
 
-Hand `carol-prod-key` to Carol; she sends it as `X-API-Key` on every
-request from then on. Nothing else to configure — the in-memory
+```
+user_id=c62bd5f5-fe0e-4f30-99fb-96adaaca78f3
+name=Carol
+api_key=carol-a099d7c3
+
+Hand this key to Carol; send it as the X-API-Key header on every request.
+The API's api_key -> user_id cache loads once at process startup (api/auth.py) --
+restart the API (or, in production, the next natural redeploy) before this key is recognized.
+```
+
+With no `--key`, a fresh key is generated from the name plus a short
+random suffix — the point is a working key handed back immediately, not
+having to invent a string of your own. Pass one explicitly
+(`--key carol-prod-key`) if you need a specific value; re-running with
+the same `--key` is safe and idempotent (confirms the same user rather
+than minting a new one). Omitting `--key` is deliberately **not**
+idempotent — each run mints a genuinely new identity, since "give me a
+new key" is the whole point of running it without one.
+
+Nothing else to configure once you have a key — the in-memory
 `api_key -> user_id` cache (`api/auth.py`) is loaded once at process
 startup, so a newly provisioned key needs the API process restarted (or,
 in production, the next natural redeploy) before it's recognized.
