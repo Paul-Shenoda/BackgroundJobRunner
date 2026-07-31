@@ -19,6 +19,18 @@ const PAGE_SIZE = 25;
 // simply stops offering "Load more" at the cap instead.
 const API_MAX_LIMIT = 200;
 const REFRESH_DEBOUNCE_MS = 200;
+// Only four transitions are SSE events at all (accepted/ready/failed/
+// cancelled -- the fixed contract, CLAUDE.md). queued -> running (a claim)
+// and the automatic retry requeue (running -> queued, see DECISIONS.md "A
+// retry emits no lifecycle event") are both real, meaningful transitions
+// with no event of their own -- a task cycling through retries can sit
+// through several of them with nothing ever telling this list to refetch,
+// which reads as the badge being stuck rather than as "no news." This
+// poll is the fallback for exactly that gap: while anything visible is
+// still non-terminal, nudge the list on a short timer regardless of
+// whether an event fired. Idle once everything's queued/running-free, so
+// a quiet dashboard isn't polling for no reason.
+const IN_FLIGHT_POLL_MS = 2000;
 
 const DEFAULT_FILTERS = {
   status: [], // [] = "All"; a list of Status values otherwise (see FiltersBar)
@@ -94,6 +106,23 @@ export function TasksProvider({ children }) {
   }, [subscribe, runFetch]);
 
   useEffect(() => () => clearTimeout(debounceRef.current), []);
+
+  // Fallback poll for the two eventless transitions (see IN_FLIGHT_POLL_MS
+  // above). Reads `tasks` fresh each tick via a ref rather than depending
+  // on it directly -- depending on `tasks` would tear down and rebuild
+  // this interval on every single refetch (including the poll's own),
+  // which defeats a steady timer.
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
+  useEffect(() => {
+    const id = setInterval(() => {
+      const hasInFlight = tasksRef.current.some(
+        (t) => t.status === "queued" || t.status === "running"
+      );
+      if (hasInFlight) runFetch(countRef.current, { silent: true });
+    }, IN_FLIGHT_POLL_MS);
+    return () => clearInterval(id);
+  }, [runFetch]);
 
   const setFilters = useCallback((patch) => {
     setFiltersState((prev) => ({ ...prev, ...patch }));

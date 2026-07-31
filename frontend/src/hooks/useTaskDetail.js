@@ -4,6 +4,12 @@ import { useAuth } from "../context/AuthContext";
 import { useEventStream } from "../context/EventStreamContext";
 import { useTasks } from "../context/TasksContext";
 
+// Mirrors TasksContext's IN_FLIGHT_POLL_MS -- see that file's comment for
+// why: queued -> running and the automatic retry requeue are real
+// transitions with no SSE event of their own, so a task cycling through
+// retries can sit in this panel with nothing ever telling it to refetch.
+const IN_FLIGHT_POLL_MS = 2000;
+
 // Keeps a single task's detail live while a panel/screen has it open --
 // the brief's single best live-update demo (watching running -> ready
 // with state history growing) depends on this NOT requiring a
@@ -63,6 +69,24 @@ export function useTaskDetail(handle, taskKey = handle) {
       }
     });
   }, [handle, subscribe, refetch]);
+
+  // Fallback poll for the same eventless transitions IN_FLIGHT_POLL_MS
+  // documents above -- a task cycling queued -> running -> queued on
+  // retries would otherwise sit here showing whatever the last SSE-driven
+  // refetch happened to catch (often just "running" from the first
+  // attempt) until the terminal failed event finally arrives. Read via a
+  // ref so the interval itself doesn't get torn down and rebuilt on every
+  // tick's own refetch.
+  const taskRef = useRef(task);
+  taskRef.current = task;
+  useEffect(() => {
+    if (!handle) return;
+    const id = setInterval(() => {
+      const status = taskRef.current?.status;
+      if (status === "queued" || status === "running") refetch();
+    }, IN_FLIGHT_POLL_MS);
+    return () => clearInterval(id);
+  }, [handle, refetch]);
 
   const runAction = useCallback(
     async (fn) => {
