@@ -74,6 +74,7 @@ Two setup-time failures were found and fixed while hardening this path (a compos
    ```
    uvicorn api.main:app --reload
    ```
+   **If you're about to test restart survival (criterion 9) by killing this process by hand, read this first:** `--reload` spawns a supervisor process plus a separate worker child (via Python's `multiprocessing`) that share the listening socket — the worker's own command line has nothing resembling "uvicorn" in it. `pkill -f "uvicorn api.main:app"`, or Ctrl+C in some terminals, kills only the supervisor; the worker survives as an orphan, keeps the port, and keeps serving requests exactly as before. It will look like the durability feature is broken (or like a restart never happened) when in fact nothing died at all. Kill by port instead, which gets both: `fuser -k 8000/tcp` (or drop `--reload` for this test — a plain `uvicorn api.main:app` has no supervisor/worker split, so any kill by name works correctly). See DECISIONS.md, "`--reload`'s orphaned worker survives a name-based kill."
 7. **Start the frontend:**
    ```
    cd frontend
@@ -81,6 +82,8 @@ Two setup-time failures were found and fixed while hardening this path (a compos
    npm run dev
    ```
    Opens on `http://localhost:5173`. The Vite dev server proxies `/tasks`, `/lanes`, `/events`, and `/health` to the FastAPI backend on `http://localhost:8000` (see `frontend/vite.config.js`) — the backend from step 6 needs to already be running.
+
+   **Also relevant to testing criterion 9 through this dev setup:** Vite's proxy doesn't propagate a mid-stream backend death to the browser — kill the backend (correctly, per the note above) while watching the dashboard through `localhost:5173`, and the connection indicator can sit on "Live" indefinitely even though the backend is genuinely gone, because the proxied `fetch()` to `/events` never sees the underlying connection close. This is a dev-proxy-only artifact: the same test against `localhost:8000` directly — either the built production frontend (`npm run build`, then reload `localhost:8000`; see [Building for production](#building-for-production)) or curl/`GET /tasks` polling — detects the disconnect in under a second and self-heals within a couple more, exactly as the deployed instance does (no proxy in production — see [Deployment](#deployment)). If you want to *see* the reconnect behavior work in the browser rather than just prove state survived via the API, use the production build for that specific check.
 
    On first load you'll land on a card asking for an API key — use the seeded demo keys (`alice-demo-key` / `bob-demo-key`, shown as hints on the card itself).
 
