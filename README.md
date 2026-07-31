@@ -33,23 +33,7 @@ The shortest path to a running app — **no manual setup required** beyond start
 
 **Idempotent on rebuild.** If a Codespace rebuild reuses the existing `pgdata` volume, `post-create.sh` detects it (`to_regclass('public.tasks')`) and skips the schema-apply-and-seed step entirely, rather than erroring on "already exists" or quietly doubling the seeded rows — `scripts/seed.py`'s bare run isn't itself idempotent, so this script must not call it twice against the same data.
 
-<details>
-<summary>Root cause of a Codespace ever landing on a bare recovery container with none of this present</summary>
-
-`.devcontainer/docker-compose.yml`'s `postgres` service used `extends` against the root `docker-compose.yml`, which merges in the extended *service* definition but not sibling top-level keys from that file — the root file's top-level `volumes: {pgdata: {}}` declaration wasn't carried over, so the merged compose project had a service referencing an undefined volume and `docker compose` refused to build at all. Codespaces silently fell back to a bare `mcr.microsoft.com/devcontainers/base:alpine` container when that happened, which is why nothing downstream — no Python packages, no Node, no `.env`, no schema, no seed data — had ever run: `postCreateCommand` never got a chance to. Fixed by redeclaring `volumes: {pgdata: {}}` at `.devcontainer/docker-compose.yml`'s own top level (a separate, isolated volume from local dev's own `pgdata`, since it's a different compose project). Verify this class of bug is actually gone with the same command that failed originally:
-
-```
-docker compose -f .devcontainer/docker-compose.yml config
-```
-
-</details>
-
-<details>
-<summary>Root cause of postCreateCommand dying at step 1 with an AssertionError</summary>
-
-`post-create.sh` runs two small Python snippets via `python3 - <<EOF` (piped to stdin) to check for and apply the schema. Each originally called `python-dotenv`'s `load_dotenv()`, which walks the *caller's* stack to locate `.env` — a stdin-piped script has no calling frame, so it raised `AssertionError: frame.f_back is not None` immediately, before ever reaching Postgres. Nothing was wrong with `.env` itself (the "Wrote .env" line had already printed) — the failure was purely `find_dotenv()` having no stack to walk. `python -m` and `python -c` both have a real frame and aren't affected; only the `python -` stdin form is. Fixed by dropping `load_dotenv()` from those two snippets entirely and exporting `DATABASE_URL` from the `.env` `post-create.sh` had just written, straight into the shell environment those snippets inherit — `os.environ["DATABASE_URL"]` then just works, no dotenv involved. Every step is now numbered (`[3/6] Applying sql/schema.sql`) and an `ERR` trap names which step failed, so a future setup failure surfaces as one clear line instead of a 20-line traceback as the only signal.
-
-</details>
+Two setup-time failures were found and fixed while hardening this path (a compose `extends` quirk that silently dropped the whole devcontainer, and a `load_dotenv()` crash specific to stdin-piped Python). Both root-cause write-ups live in `DECISIONS.md` ("Codespaces landed on a bare recovery container" and "post-create.sh died at step 1").
 
 ## Quickstart — Local
 
@@ -124,6 +108,45 @@ Every endpoint requires `X-API-Key: <key>` and is scoped to that key's own user 
 
 Every `/tasks/{handle}...` endpoint raises `404` via `TaskNotFoundError` if the handle doesn't exist for the calling user.
 
+### Mock worker parameters
+
+Every acceptance scenario is reproducible through three `params` keys the mock worker reads (`engine/workers/mock.py`). The engine itself never inspects `params` — they pass through opaquely, and there is deliberately no per-lane validation (see DECISIONS.md):
+
+| Param | Type | Effect |
+|---|---|---|
+| `duration_ms` | int | How long the worker runs (sleeps) before finishing. Default: random 3000–15000. |
+| `fail` | bool | Retryable failure *after* the sleep — watch it requeue with 1s/2s/4s backoff, then exhaust to `failed` with `retryable: false` after `MAX_ATTEMPTS` (default 3). |
+| `fail_permanent` | bool | Non-retryable failure — lands in `failed` immediately, no retry. Takes precedence over `fail` if both are set. |
+
+### Calling it with curl
+
+```bash
+BASE=https://job-runner-app.mangobush-0fc2a290.eastus.azurecontainerapps.io   # or http://localhost:8000
+KEY="X-API-Key: alice-demo-key"
+
+# Submit a 10s scrape job -- the handle comes back immediately, long before the work finishes
+curl -s -X POST "$BASE/tasks" -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"lane": "scrape", "params": {"duration_ms": 10000}}'
+
+# Poll it (substitute the handle the submit returned)
+curl -s "$BASE/tasks/scrape-4" -H "$KEY"
+
+# Collect the result -- flips `collected`, which is what releases the handle for reuse
+curl -s "$BASE/tasks/scrape-4/result" -H "$KEY"
+
+# Cancel a queued or running task
+curl -s -X POST "$BASE/tasks/scrape-4/cancel" -H "$KEY"
+
+# A retryable failure -- fails after 2s, requeues with backoff, exhausts to `failed`
+curl -s -X POST "$BASE/tasks" -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"lane": "report", "params": {"duration_ms": 2000, "fail": true}}'
+
+# Watch the live event stream (leave it running in a second terminal)
+curl -N "$BASE/events" -H "$KEY"
+```
+
+Why `scrape-4` in the examples and not `scrape-1`: with fresh seed data, Alice's `scrape-1`/`scrape-2` are seeded *finished-but-uncollected* rows and `scrape-3` is the inert queued row — all three hold their numbers, so the first real submission gets the lowest free number, `scrape-4`. That's the no-collision rule doing its job, not a numbering bug; collect the seeded rows and the low numbers free up.
+
 ### Task object
 
 The nine fields below are fixed by the contract — exact names, exact shapes, everywhere they appear:
@@ -169,6 +192,8 @@ Collecting a result and retrying a failed task deliberately emit no event — `c
 pytest
 ```
 
+**Stop any locally running API first** (the `uvicorn` from the quickstart). The tests and a dev server share the same `DATABASE_URL`, and the engine's claim queue is deliberately not scoped per process — so a second running engine is a second worker pool on the same queue, silently doubling effective concurrency and stealing the suite's own jobs. The visible symptom is flaky failures in exactly the two most scrutinised tests (`test_concurrency_limit_respected`, `test_state_survives_restart`) while everything else passes.
+
 Async, written against the live HTTP API (not engine internals), one test named per acceptance criterion — see `tests/`. `pytest.ini` pins a session-scoped event loop, since the tests share one session-scoped app/engine/db-pool (`tests/conftest.py`). `tests/test_restart.py` genuinely kills and respawns the API process to prove durability (criterion 9) — it's marked `slow` (informational only, not deselected by default): `pytest -m "not slow"` skips it for a quick loop, but a plain `pytest` run always includes it, since criterion 9 is the one most scrutinized and an easy-to-skip marker that silently excluded it would prove nothing.
 
 ## Seeding
@@ -193,6 +218,10 @@ This creates:
   more, and why never `running`), both lanes (`scrape`, `report`), a mix
   of collected/uncollected terminal tasks, and `created_at` spread across
   the last two weeks so date-range filtering has something to filter.
+  The uncollected ones hold their handle numbers (that's what they're
+  there to demonstrate), which is why a fresh scrape submission starts
+  at `scrape-4`, not `scrape-1` — see the note under
+  [Calling it with curl](#calling-it-with-curl).
   Every failed row has a distinct, honest reason (some exhausted-retry
   wording, some permanent), and every task has a plausible `task_events`
   history backing its detail view.
@@ -603,3 +632,13 @@ az containerapp create -g rg-job-runner -n job-runner-app \
 See `DECISIONS.md` for the full log of forks resolved during the build, with options considered and why.
 
 ## What I'd Do Next
+
+In rough priority order (each expanded in `DECISIONS.md`, "What I'd do next"):
+
+- **Multi-replica workers** with a cluster-wide concurrency budget rather than a per-process one. The lease design already supports multiple claimers safely (`FOR UPDATE SKIP LOCKED`); what's missing is coordinating the *limit* across replicas.
+- **Idempotency keys on the worker contract**, so at-least-once execution becomes safe for workers with real side effects.
+- **Atomic handle allocation** — collapse compute-lowest-free-number + INSERT into one statement, replacing the retry-with-jittered-backoff loop entirely rather than bounding it (see DECISIONS.md, "Handle-allocation retry budget 5 → 25").
+- **A delta endpoint** (`GET /tasks?updated_since=`) so reconnects don't need a full list refetch as the task table grows.
+- **Scheduled and recurring jobs** — the `not_before` column used for retry backoff is already most of the mechanism needed for "run this at 3am."
+- **Per-lane parameter schemas** with server-side validation, worth building the moment there's a real worker whose params actually matter. Until then params are opaque by design — which also means `duration_ms: 10**18` is accepted and will occupy a concurrency slot until cancelled; a documented limitation, not an oversight.
+- **Structured metrics** — queue depth, time-to-claim, worker utilisation, retry rates — the brief's emphasis on observability naturally extends past the dashboard into instrumentation.
