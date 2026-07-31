@@ -16,6 +16,11 @@ export default function TaskRow({ task }) {
   // collected=true (there's no collect action for them), so this needs its
   // own check rather than folding into the collected condition.
   const isDimmed = task.collected || task.status === "cancelled";
+  // A seeded row only ever sits non-terminal because seed.py pinned it
+  // there on purpose (a future not_before) -- a real queued task moves
+  // within seconds. The badge alone reads as "the system is stuck" without
+  // this, since it says where the row came from, not that it's inert.
+  const isInertSeeded = task.seeded && task.status === "queued";
 
   return (
     <button
@@ -38,8 +43,15 @@ export default function TaskRow({ task }) {
           {task.lane}
         </span>
         {task.seeded && (
-          <span className="shrink-0 rounded bg-[color:var(--color-accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-[color:var(--color-accent)]">
-            SEEDED
+          <span
+            className="shrink-0 rounded bg-[color:var(--color-accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-[color:var(--color-accent)]"
+            title={
+              isInertSeeded
+                ? "Seeded demo row, held in queued by a future not_before -- real submissions run normally"
+                : undefined
+            }
+          >
+            {isInertSeeded ? "SEEDED · INERT" : "SEEDED"}
           </span>
         )}
       </div>

@@ -43,6 +43,13 @@ docker compose -f .devcontainer/docker-compose.yml config
 
 </details>
 
+<details>
+<summary>Root cause of postCreateCommand dying at step 1 with an AssertionError</summary>
+
+`post-create.sh` runs two small Python snippets via `python3 - <<EOF` (piped to stdin) to check for and apply the schema. Each originally called `python-dotenv`'s `load_dotenv()`, which walks the *caller's* stack to locate `.env` — a stdin-piped script has no calling frame, so it raised `AssertionError: frame.f_back is not None` immediately, before ever reaching Postgres. Nothing was wrong with `.env` itself (the "Wrote .env" line had already printed) — the failure was purely `find_dotenv()` having no stack to walk. `python -m` and `python -c` both have a real frame and aren't affected; only the `python -` stdin form is. Fixed by dropping `load_dotenv()` from those two snippets entirely and exporting `DATABASE_URL` from the `.env` `post-create.sh` had just written, straight into the shell environment those snippets inherit — `os.environ["DATABASE_URL"]` then just works, no dotenv involved. Every step is now numbered (`[3/6] Applying sql/schema.sql`) and an `ERR` trap names which step failed, so a future setup failure surfaces as one clear line instead of a 20-line traceback as the only signal.
+
+</details>
+
 ## Quickstart — Local
 
 1. **Start Postgres:**
@@ -180,33 +187,51 @@ This creates:
 - **Two users** — `Alice` (`X-API-Key: alice-demo-key`) and `Bob`
   (`X-API-Key: bob-demo-key`). A bare run never touches any other user —
   it only ever creates/updates these two and inserts their tasks.
-- **~28 tasks for Alice, ~7 for Bob** — every status represented
-  (`queued`, `running`, `ready`, `failed`, `cancelled`), both lanes
-  (`scrape`, `report`), a mix of collected/uncollected terminal tasks, and
-  `created_at` spread across the last two weeks so date-range filtering has
-  something to filter. Every failed row has a distinct, honest reason
-  (some exhausted-retry wording, some permanent), and every task has a
-  plausible `task_events` history backing its detail view.
+- **~28 tasks for Alice, ~7 for Bob** — `ready`, `failed`, and `cancelled`
+  well represented, plus exactly one `queued` row (see below on why not
+  more, and why never `running`), both lanes (`scrape`, `report`), a mix
+  of collected/uncollected terminal tasks, and `created_at` spread across
+  the last two weeks so date-range filtering has something to filter.
+  Every failed row has a distinct, honest reason (some exhausted-retry
+  wording, some permanent), and every task has a plausible `task_events`
+  history backing its detail view.
 - Every seeded row has `seeded: true` (returned by both `GET /tasks` and
   `GET /tasks/{handle}` — additive extras on top of the 9 fixed contract
   fields, see DECISIONS.md) so it's never mistaken for real activity.
 
-Rows are inserted directly via SQL, not through `engine.submit()` — a
-seeded `queued` row would otherwise get claimed and actually "run" the
-moment the app starts. The couple of seeded `queued` rows carry a
-`not_before` decades in the future for the same reason, and the one seeded
-`running` row carries a `lease_expires_at` decades in the future so the
-reaper doesn't reclaim it on boot.
+Rows are inserted directly via SQL, not through `engine.submit()`. Two
+reasons, not one: first, a seeded `queued`/`running` row would otherwise get
+claimed and actually run the moment the app starts, so nothing seeded
+would still be in that state a minute later — the whole point of seed
+data is to have something to look at, and a live worker pool would erase
+it almost immediately (this is also why the filters need dedicated,
+artificially-held rows at all: real submissions would all reach `ready`
+within about a minute at this project's `duration_ms` range, leaving
+`status=queued`/`status=running` nothing to filter on). Second, direct
+inserts are the only way to backdate `created_at`/`updated_at` and write a
+`task_events` history that looks like it happened over the last two weeks
+rather than in the last second.
 
-**Those seeded `queued` rows are permanently inert, on purpose.** With
-`not_before` decades out, the dispatch loop's `claim_next` will never
-select them — they'll sit in `queued` forever, not just until the next
-poll. That's deliberate (see above: a real `queued` row would get claimed
-and run within a second of boot, defeating the point of seed data looking
-like seed data), but it reads as a stuck job if you don't know why when
-filtering the dashboard by `status=queued`. A couple are kept specifically
-so that filter has something to show; the `SEEDED` badge is what tells you
-they're not actually stuck.
+**Exactly one seeded row is ever non-terminal, and it's `queued`, never
+`running`.** It carries a `not_before` decades in the future, so the
+dispatch loop's `claim_next` will never select it — it sits in `queued`
+forever, not just until the next poll. One row is enough to demonstrate
+`status=queued` filtering; more would just be more rows to explain away
+as inert for no added coverage. There's deliberately no seeded `running`
+row at all: a permanently-running job reads as a hung worker, which is
+more alarming than a permanently-queued one, and `running` is trivially
+demonstrated by submitting a real job — seeding one bought nothing and
+cost credibility (see DECISIONS.md, "seeded non-terminal rows read as
+'the system is stuck'").
+
+An inert seeded row still reads as *stuck*, not *demo data*, if all you
+see is a `SEEDED` badge next to `queued` — the badge says where the row
+came from, not that it will never move. The dashboard marks it more
+plainly: the list badge reads **SEEDED · INERT** (with a tooltip) and the
+detail panel states outright, "Seeded demo row: held in queued by a
+future `not_before` so the worker pool never claims it. Real submissions
+run normally." Terminal seeded rows (`ready`/`failed`/`cancelled`) get
+neither — they look finished because they are, nothing to explain.
 
 Flags:
 

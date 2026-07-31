@@ -59,7 +59,7 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
               </span>
               {task.seeded && (
                 <span className="rounded bg-[color:var(--color-accent-soft)] px-2 py-0.5 text-[10px] font-semibold tracking-wide text-[color:var(--color-accent)]">
-                  SEEDED
+                  {task.status === "queued" ? "SEEDED · INERT" : "SEEDED"}
                 </span>
               )}
               <span className="font-mono-tabular text-xs text-[color:var(--color-ink-faint)]">
@@ -74,6 +74,13 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
                 <span className="text-xs text-[color:var(--color-ink-faint)]">collected</span>
               )}
             </div>
+
+            {task.seeded && task.status === "queued" && (
+              <div className="rounded-lg border border-[color:var(--color-accent)]/30 bg-[color:var(--color-accent-soft)] p-3 text-xs text-[color:var(--color-ink)]">
+                Seeded demo row: held in queued by a future not_before so the
+                worker pool never claims it. Real submissions run normally.
+              </div>
+            )}
 
             <Actions task={task} cancel={cancel} retry={retry} collect={collect} />
 

@@ -75,13 +75,20 @@ PROTECTED_KEYS = {
     "phase4-test-key-restart",
 }
 
-# Sentinel far-future timestamp for the handful of seed rows that must never
-# be picked up by the live system on boot: a couple of 'queued' rows
-# (not_before) and the one 'running' demo row (lease_expires_at). The
-# dispatch loop only claims queued rows with not_before <= now(), and the
-# reaper only reclaims running rows with lease_expires_at < now() — this
-# date is comfortably past either check for the life of this demo, without
-# inventing a "scheduled job" feature the engine doesn't actually have.
+# Sentinel far-future timestamp for the one seeded 'queued' row that must
+# never be picked up by the live system on boot: the dispatch loop only
+# claims queued rows with not_before <= now(), and this date is comfortably
+# past that check for the life of this demo, without inventing a "scheduled
+# job" feature the engine doesn't actually have.
+#
+# There is deliberately no seeded 'running' row (and, as of the inertness
+# review below, only ONE seeded 'queued' row, not several) — see
+# DECISIONS.md, "seeded non-terminal rows read as 'the system is stuck'".
+# A permanently-running job reads as a hung worker, more alarming than a
+# permanently-queued one, and 'running' is trivially demonstrated by
+# submitting a real job — seeding one bought nothing and cost credibility.
+# A single queued row is still enough to demonstrate `status=queued`
+# filtering; more would just be more rows to explain away as inert.
 FAR_FUTURE = datetime(2099, 1, 1, tzinfo=timezone.utc)
 
 # Distinct, honest failure reasons (CLAUDE.md: "do not use the same reason
@@ -124,7 +131,7 @@ class Spec:
 
     user_id: uuid.UUID
     lane: str
-    kind: str  # ready1 | ready2 | exhausted | permanent | cancel_queued | cancel_running | queued_future | running_demo
+    kind: str  # ready1 | ready2 | exhausted | permanent | cancel_queued | cancel_running | queued_future
     days_ago: float
     duration_ms: int
     collected: bool = False
@@ -172,9 +179,12 @@ def build_specs(alice_id: uuid.UUID, bob_id: uuid.UUID) -> list[Spec]:
         Spec(alice_id, "scrape", "exhausted", 0.95, 5600, collected=True, reason=next(r)),
         Spec(alice_id, "report", "ready1", 0.6, 7600),
         Spec(alice_id, "scrape", "ready1", 0.35, 4400, collected=True),
-        Spec(alice_id, "report", "queued_future", 0.12, 8800),
+        Spec(alice_id, "report", "ready1", 0.12, 8800),
+        # The ONE seeded queued row, system-wide -- enough to demonstrate
+        # `status=queued` filtering without needing more than one inert row
+        # to explain (see FAR_FUTURE's comment above).
         Spec(alice_id, "scrape", "queued_future", 0.06, 5900),
-        Spec(alice_id, "report", "running_demo", 0.02, 12000),
+        Spec(alice_id, "report", "cancel_running", 0.02, 12000),
     ]
 
     bob = [
@@ -184,7 +194,7 @@ def build_specs(alice_id: uuid.UUID, bob_id: uuid.UUID) -> list[Spec]:
         Spec(bob_id, "report", "exhausted", 1.8, 4900, collected=True, reason=next(r)),
         Spec(bob_id, "scrape", "permanent", 1.1, 3600, reason=next(p)),
         Spec(bob_id, "report", "cancel_queued", 0.6, 8200),
-        Spec(bob_id, "scrape", "queued_future", 0.1, 6600),
+        Spec(bob_id, "scrape", "ready1", 0.1, 6600),
     ]
 
     # Every reason pool must be used exactly once -- if this ever fires, the
@@ -345,22 +355,6 @@ def materialize(now: datetime, number: int, spec: Spec) -> tuple[dict[str, Any],
         # matches this row. Without this, the pool would claim and actually
         # run it within a second of the app starting.
         row.update(status="queued", attempts=0, not_before=FAR_FUTURE, updated_at=created_at)
-
-    elif spec.kind == "running_demo":
-        # The one seeded 'running' row, purely so the dashboard has
-        # something to screenshot in that state. lease_expires_at is set
-        # far in the future so the reaper's `lease_expires_at < now()`
-        # check never matches it -- a real dead lease here would otherwise
-        # get reclaimed (and reset to 'queued') the moment the app boots.
-        t_run1 = created_at + timedelta(seconds=2)
-        events += [("queued", "running", None, 1, t_run1)]
-        row.update(
-            status="running",
-            attempts=1,
-            worker_id="seed-demo-worker",
-            lease_expires_at=FAR_FUTURE,
-            updated_at=t_run1,
-        )
 
     else:
         raise ValueError(f"unknown spec kind: {spec.kind!r}")
