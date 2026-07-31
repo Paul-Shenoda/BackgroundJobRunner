@@ -143,6 +143,12 @@
     color: var(--color-ink);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+    /* The app never scrolls at the document level -- every list/panel
+       has its own overflow container -- so a rubber-band drag reaching
+       the document can only mean one thing on iOS: pull-to-refresh,
+       i.e. a full page reload of a live ops dashboard mid-gesture.
+       Contain it here once instead of chasing it per-surface. */
+    overscroll-behavior-y: contain;
   }
 
   ::selection {

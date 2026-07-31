@@ -76,11 +76,23 @@ export default function NewTaskSheet() {
   }
 
   return (
-    <div className="fixed inset-0 z-40 flex items-end justify-center bg-black/50 sm:items-center" onClick={close}>
+    // The dim layer is a SIBLING of the form, not its parent: it carries
+    // touch-none so a drag starting on the backdrop can't rubber-band the
+    // document (iOS pull-to-refresh = a full page reload mid-demo), and
+    // touch-action restricts the whole subtree of whatever it's set on --
+    // as the form's ancestor it would kill scrolling inside the sheet too.
+    <div className="fixed inset-0 z-40 flex items-end justify-center sm:items-center">
+      <div className="absolute inset-0 touch-none bg-black/50" onClick={close} />
       <form
-        onClick={(e) => e.stopPropagation()}
         onSubmit={handleSubmit}
-        className="flex w-full max-w-md flex-col gap-4 rounded-t-2xl border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] p-5 sm:rounded-2xl"
+        // max-h + internal scroll: in phone LANDSCAPE the visual viewport
+        // (~300px after browser chrome) is shorter than this form, which
+        // used to leave the submit button unreachable below the fold --
+        // and with nothing scrollable, the drag went to the document and
+        // triggered pull-to-refresh. overscroll-contain stops the scroll
+        // chaining once the sheet's own scroll hits its edge; dvh tracks
+        // iOS's collapsing toolbars where vh would overshoot.
+        className="relative flex max-h-[85dvh] w-full max-w-md flex-col gap-4 overflow-y-auto overscroll-contain rounded-t-2xl border border-[color:var(--color-hairline)] bg-[color:var(--color-surface)] p-5 sm:rounded-2xl"
       >
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[color:var(--color-ink)]">New task</h2>
