@@ -12,3 +12,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+# `extends` only merges the named SERVICE definition -- it does not pull in
+# sibling top-level keys (volumes, networks, ...) from the extended file.
+# The root docker-compose.yml's postgres service mounts a `pgdata` named
+# volume, declared at that file's own top level; extending the service here
+# carries the `volumes: [pgdata:...]` mount reference over, but not the
+# top-level `volumes: {pgdata: {}}` declaration that name resolves against.
+# Without redeclaring it here, this merged compose project has a service
+# referencing an undefined volume, which docker compose refuses to build
+# (this is what broke Codespaces creation -- see DECISIONS.md).
+volumes:
+  pgdata:

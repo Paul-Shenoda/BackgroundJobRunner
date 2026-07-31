@@ -1,6 +1,313 @@
 # Background Job Runner
 
+A background job runner: submit a job, get a handle back immediately, work runs in a concurrency-limited pool, state survives restarts, lifecycle events stream live to clients.
+
 ## Overview
+
+Submit a job over a REST API and get a short handle back before it runs; work executes in a Postgres-backed pool under a concurrency limit, survives process restarts via lease-based claiming and a reaper, and streams lifecycle events to clients over SSE. Two demo lanes (`scrape`, `report`) run against a mock worker, with a React dashboard for filtering, sorting, and operating on tasks live.
+
+**Live:** https://job-runner-app.mangobush-0fc2a290.eastus.azurecontainerapps.io
+**Demo keys:** `X-API-Key: alice-demo-key` / `X-API-Key: bob-demo-key`
+
+**Contents:** [Codespaces](#quickstart--github-codespaces) · [Local setup](#quickstart--local) · [API Reference](#api-reference) · [Tests](#running-the-tests) · [Seeding](#seeding) · [Frontend](#frontend) · [Architecture](#architecture) · [Deployment](#deployment) · [Decisions & Tradeoffs](#decisions--tradeoffs) · [What I'd Do Next](#what-id-do-next)
+
+## Quickstart — GitHub Codespaces
+
+The shortest path to a running app — **no manual setup required** beyond starting the two dev servers; everything else is automatic.
+
+1. **Open in a Codespace** (Code → Codespaces → Create codespace on main). `.devcontainer/` brings up two containers — `app` (Python 3.12 + a Node 20 feature) and `postgres` — on the same compose network.
+2. **Wait for `postCreateCommand`.** It runs automatically, no input needed: installs `requirements.txt`, writes `.env` with `DATABASE_URL` pointed at the `postgres` service (not `localhost` — there's no host loopback to share between containers), applies `sql/schema.sql`, seeds Alice/Bob via `scripts/seed.py`, and runs `npm install` in `frontend/`.
+3. **Start the backend**, in one terminal:
+   ```
+   uvicorn api.main:app --reload --host 0.0.0.0
+   ```
+4. **Start the frontend**, in another terminal:
+   ```
+   cd frontend && npm run dev
+   ```
+5. **Open the forwarded ports.** VS Code's Ports tab prompts to open them in a browser once both processes are up — `8000` (API) and `5173` (frontend) are both declared in `devcontainer.json`'s `forwardPorts`. A forwarded port is private by default (requires your GitHub login through the proxy); switch to Public from the Ports tab only if you need to hand the URL to someone without repo access.
+6. **Sign in** with `alice-demo-key` or `bob-demo-key` (shown as hints on the login card too).
+
+`--host 0.0.0.0` matters here specifically, unlike plain local dev: Codespaces forwards ports out of the container by listening address.
+
+**Idempotent on rebuild.** If a Codespace rebuild reuses the existing `pgdata` volume, `post-create.sh` detects it (`to_regclass('public.tasks')`) and skips the schema-apply-and-seed step entirely, rather than erroring on "already exists" or quietly doubling the seeded rows — `scripts/seed.py`'s bare run isn't itself idempotent, so this script must not call it twice against the same data.
+
+<details>
+<summary>Root cause of a Codespace ever landing on a bare recovery container with none of this present</summary>
+
+`.devcontainer/docker-compose.yml`'s `postgres` service used `extends` against the root `docker-compose.yml`, which merges in the extended *service* definition but not sibling top-level keys from that file — the root file's top-level `volumes: {pgdata: {}}` declaration wasn't carried over, so the merged compose project had a service referencing an undefined volume and `docker compose` refused to build at all. Codespaces silently fell back to a bare `mcr.microsoft.com/devcontainers/base:alpine` container when that happened, which is why nothing downstream — no Python packages, no Node, no `.env`, no schema, no seed data — had ever run: `postCreateCommand` never got a chance to. Fixed by redeclaring `volumes: {pgdata: {}}` at `.devcontainer/docker-compose.yml`'s own top level (a separate, isolated volume from local dev's own `pgdata`, since it's a different compose project). Verify this class of bug is actually gone with the same command that failed originally:
+
+```
+docker compose -f .devcontainer/docker-compose.yml config
+```
+
+</details>
+
+## Quickstart — Local
+
+1. **Start Postgres:**
+   ```
+   docker compose up -d
+   ```
+2. **Configure environment.** Copy `.env.example` to `.env` — its defaults already match the `docker-compose.yml` Postgres above. All variables are read via `python-dotenv`:
+
+   | Variable            | Default | Purpose                                                        |
+   |---------------------|---------|-----------------------------------------------------------------|
+   | `DATABASE_URL`      | —       | Postgres DSN, `postgresql://user:pass@host:port/db`             |
+   | `CONCURRENCY_LIMIT`  | `2`     | Max tasks running at once, this process                        |
+   | `LEASE_SECONDS`      | `30`    | How long a claimed task's lease lives before the reaper reclaims it |
+   | `HEARTBEAT_INTERVAL` | `10`    | How often a running task's lease is renewed                    |
+   | `MAX_ATTEMPTS`       | `3`     | Attempts (including the first) before a retryable failure gives up |
+   | `LOG_LEVEL`          | `INFO`  | Root logger level — `DEBUG` for verbose per-poll dispatch noise, `INFO` to see claims, retries, cancellations, and reaper reclaims without the noise |
+3. **Install Python dependencies** (inside a virtualenv of your choice):
+   ```
+   pip install -r requirements.txt
+   ```
+4. **Apply the schema.** `sql/schema.sql` is the single source of truth for the database, applied by hand — there's no migration tooling and no `docker-entrypoint-initdb.d` init script wired into `docker-compose.yml` (see DECISIONS.md, "Raw SQL via asyncpg rather than an ORM": migrations were a deliberate non-goal for this proof of concept). Apply it once:
+   ```
+   docker compose exec postgres psql -U jobrunner -d jobrunner -f - < sql/schema.sql
+   ```
+
+   **If you already have a running database from before `tasks.seq` was added** (the monotonic ordering column — see DECISIONS.md, "Handle resolution ordering uses a monotonic sequence, not a timestamp"), a fresh `schema.sql` apply won't retroactively add it to an existing table. Run the one statement by hand instead:
+   ```
+   docker compose exec postgres psql -U jobrunner -d jobrunner -c "ALTER TABLE tasks ADD COLUMN seq BIGSERIAL;"
+   ```
+   Same end state either way — a fresh clone gets `seq` from `schema.sql` directly; an existing database gets there via this one `ALTER TABLE`. Worth keeping in mind if `schema.sql` picks up further changes later: without migration tooling, every existing database needs its own hand-applied catch-up statement, not just new ones.
+5. **Seed demo data:**
+   ```
+   python -m scripts.seed
+   ```
+   Creates Alice and Bob with a realistic spread of tasks across every status. See [Seeding](#seeding) below for exactly what this creates and the available flags.
+6. **Start the backend:**
+   ```
+   uvicorn api.main:app --reload
+   ```
+7. **Start the frontend:**
+   ```
+   cd frontend
+   npm install
+   npm run dev
+   ```
+   Opens on `http://localhost:5173`. The Vite dev server proxies `/tasks`, `/lanes`, `/events`, and `/health` to the FastAPI backend on `http://localhost:8000` (see `frontend/vite.config.js`) — the backend from step 6 needs to already be running.
+
+   On first load you'll land on a card asking for an API key — use the seeded demo keys (`alice-demo-key` / `bob-demo-key`, shown as hints on the card itself).
+
+### Known issues
+
+**Docker Desktop + WSL2: pulls fail with truncated layers.** Docker Desktop's containerd image store mishandles range-requested downloads over WSL2, causing `httpReadSeeker: failed open ... EOF` mid-pull. Affects both Windows 10 and 11. Fix: in Docker Desktop, **Settings → General**, disable **"Use containerd for pulling and storing images"**, then Apply & Restart.
+
+## API Reference
+
+Every endpoint requires `X-API-Key: <key>` and is scoped to that key's own user — a user never sees another user's tasks. Missing and invalid keys get the identical `401` (distinguishing them would let a caller learn which keys exist by probing).
+
+### Endpoints
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/tasks` | Enqueue. Body: `{"lane": str, "params": {}}`. Returns the task object immediately (`202`), well before the job runs. |
+| `GET` | `/tasks` | List. Query params: `status` (repeatable, e.g. `?status=queued&status=running`), `lane`, `created_after`/`created_before` (ISO 8601), `sort_by` (`created_at` \| `updated_at`), `sort_order` (`asc` \| `desc`), `limit`, `offset`. |
+| `GET` | `/tasks/{handle}` | Fetch one. Includes the detail-only extras below. `404` if unknown. |
+| `GET` | `/tasks/{handle}/result` | Fetch the result; sets `collected = true`. Works for both `ready` and `failed` — collection is the ACK that releases the handle either way. `409` if still `queued`/`running` or already collected. |
+| `POST` | `/tasks/{handle}/cancel` | Cancel a `queued` or `running` task. `409` if already terminal. |
+| `POST` | `/tasks/{handle}/retry` | Retry a `failed` task (not in the brief's minimum list — added so the dashboard can offer it as an operator action). `409` if not `failed` or already collected. |
+| `GET` | `/lanes` | The registered lane names (`["scrape", "report"]`), so the frontend's lane dropdown isn't hardcoded. |
+| `GET` | `/events` | SSE stream of this user's lifecycle events (see below). |
+| `GET` | `/health` | Liveness: engine/database status, current concurrency, in-flight count, configured heartbeat interval. Not user-scoped. |
+
+Every `/tasks/{handle}...` endpoint raises `404` via `TaskNotFoundError` if the handle doesn't exist for the calling user.
+
+### Task object
+
+The nine fields below are fixed by the contract — exact names, exact shapes, everywhere they appear:
+
+```json
+{
+  "handle": "scrape-1",
+  "lane": "scrape",
+  "params": {},
+  "status": "queued",
+  "result": null,
+  "error": null,
+  "created_at": "2026-05-30T18:00:00Z",
+  "updated_at": "2026-05-30T18:00:00Z",
+  "collected": false
+}
+```
+
+- `status` ∈ `queued` | `running` | `ready` | `failed` | `cancelled` — exactly these five.
+- `result` is populated only when `status == "ready"`.
+- `error` is populated only when `status == "failed"`, shaped `{ "reason": str, "retryable": bool }`.
+- `collected` flips to `true` once the result has been retrieved via `GET /tasks/{handle}/result`. It's a flag, not a status — a collected task keeps its terminal `ready`/`failed` status.
+- Timestamps are ISO 8601 UTC with a trailing `Z`.
+
+`GET /tasks` and `GET /tasks/{handle}` both add extra fields on top of the nine — additive only, never a rename or a reshape: `attempts`, `max_attempts`, `seeded`. `GET /tasks/{handle}` alone also adds `state_history`, the full list of state transitions (`from_status`, `to_status`, `reason`, `attempt`, `created_at`) backing the dashboard's detail view.
+
+### Events (SSE)
+
+`GET /events` streams one JSON object per line, prefixed `data: `, plus `: ping\n\n` comment lines every 15 seconds to hold the connection open through proxies and load balancers with an idle-request timeout (this is what keeps the stream alive on Azure Container Apps — see [Deployment](#deployment)). No history replay on reconnect: the stream is a liveness hint, not a data channel — a client reconnecting refetches `GET /tasks` for ground truth.
+
+```json
+{ "type": "accepted",  "handle": "scrape-1", "lane": "scrape", "summary": "..." }
+{ "type": "ready",     "handle": "scrape-1", "lane": "scrape", "summary": "..." }
+{ "type": "failed",    "handle": "scrape-1", "lane": "scrape", "reason": "...", "retryable": true }
+{ "type": "cancelled", "handle": "scrape-1", "lane": "scrape" }
+```
+
+Collecting a result and retrying a failed task deliberately emit no event — `collected` is a flag, not a lifecycle transition, and a retry has no honest event type in this fixed set.
+
+## Running the Tests
+
+```
+pytest
+```
+
+Async, written against the live HTTP API (not engine internals), one test named per acceptance criterion — see `tests/`. `pytest.ini` pins a session-scoped event loop, since the tests share one session-scoped app/engine/db-pool (`tests/conftest.py`). `tests/test_restart.py` genuinely kills and respawns the API process to prove durability (criterion 9) — it's marked `slow` (informational only, not deselected by default): `pytest -m "not slow"` skips it for a quick loop, but a plain `pytest` run always includes it, since criterion 9 is the one most scrutinized and an easy-to-skip marker that silently excluded it would prove nothing.
+
+## Seeding
+
+`scripts/seed.py` creates two named demo users and a realistic spread of
+tasks across every status, so the dashboard's filtering, sorting, and detail
+views have something meaningful to show without needing to manually drive
+jobs through the API first. Run it once the schema is applied and the API's
+dependencies are installed:
+
+```
+python -m scripts.seed
+```
+
+This creates:
+
+- **Two users** — `Alice` (`X-API-Key: alice-demo-key`) and `Bob`
+  (`X-API-Key: bob-demo-key`). A bare run never touches any other user —
+  it only ever creates/updates these two and inserts their tasks.
+- **~28 tasks for Alice, ~7 for Bob** — every status represented
+  (`queued`, `running`, `ready`, `failed`, `cancelled`), both lanes
+  (`scrape`, `report`), a mix of collected/uncollected terminal tasks, and
+  `created_at` spread across the last two weeks so date-range filtering has
+  something to filter. Every failed row has a distinct, honest reason
+  (some exhausted-retry wording, some permanent), and every task has a
+  plausible `task_events` history backing its detail view.
+- Every seeded row has `seeded: true` (returned by both `GET /tasks` and
+  `GET /tasks/{handle}` — additive extras on top of the 9 fixed contract
+  fields, see DECISIONS.md) so it's never mistaken for real activity.
+
+Rows are inserted directly via SQL, not through `engine.submit()` — a
+seeded `queued` row would otherwise get claimed and actually "run" the
+moment the app starts. The couple of seeded `queued` rows carry a
+`not_before` decades in the future for the same reason, and the one seeded
+`running` row carries a `lease_expires_at` decades in the future so the
+reaper doesn't reclaim it on boot.
+
+**Those seeded `queued` rows are permanently inert, on purpose.** With
+`not_before` decades out, the dispatch loop's `claim_next` will never
+select them — they'll sit in `queued` forever, not just until the next
+poll. That's deliberate (see above: a real `queued` row would get claimed
+and run within a second of boot, defeating the point of seed data looking
+like seed data), but it reads as a stuck job if you don't know why when
+filtering the dashboard by `status=queued`. A couple are kept specifically
+so that filter has something to show; the `SEEDED` badge is what tells you
+they're not actually stuck.
+
+Flags:
+
+```
+python -m scripts.seed --reset               # delete existing seeded rows, then reseed fresh ones
+python -m scripts.seed --clear               # delete existing seeded rows and STOP -- no reseed
+python -m scripts.seed --wipe                # delete ALL rows (tasks + users), asks for confirmation, then reseeds
+python -m scripts.seed --purge-debug-users   # delete non-demo, non-test-fixture users; previews and asks first
+```
+
+`--reset` and `--clear` both delete every `seeded = true` row — the
+difference is only what happens next. `--reset` reseeds immediately
+afterward, so you end up back where you started with a fresh batch (new
+timestamps, same shape). `--clear` stops right there, so you end up with
+*no* seed data at all — useful for a demo/recording where you want to
+show the dashboard against a clean slate, or against only your own real
+traffic, before seeding it back in later with a bare `python -m
+scripts.seed`. `--reset`, `--clear`, and `--wipe` are mutually exclusive
+(the script rejects combining them, rather than one silently winning).
+
+`--purge-debug-users` exists for cleaning up ad-hoc users left behind by
+manual testing (e.g. a one-off key created by hand while poking at the API).
+It is opt-in only — a bare run, and even `--reset`/`--clear`, never delete
+another user — and it always prints exactly who it found and how many tasks
+they have before asking for confirmation, since deleting a user cascades to
+their real (non-seed) task data too. It can be combined with `--clear` (both
+are cleanup-only operations); combined with `--reset` or `--wipe`, both still
+run in the same order — the purge, then the reseed.
+
+### Provisioning a real user's API key
+
+There is deliberately no signup flow — no registration form, no email
+verification, no key rotation (see DECISIONS.md, "Auth beyond API
+keys... no signup, login, password reset, or key rotation"). The brief
+asks for "a per-user API key scoped to that user's data," not a user
+management system, so keys are provisioned by an operator, out of band.
+
+Every current caller that needs a user — `scripts/seed.py`'s demo users,
+the API's own seeded users at startup, the pytest fixtures — goes through
+the same idempotent function: `scripts.bootstrap.ensure_user(dsn, name,
+api_key)`. It's `INSERT ... ON CONFLICT (api_key) DO UPDATE ... RETURNING
+id` — safe to run again with the same key, and the only place a user row
+gets created. There's no CLI wrapper around it (nothing here needed one
+until this point), so an operator provisioning a new real user runs it
+directly:
+
+```
+python -c "
+import asyncio, os
+from dotenv import load_dotenv
+from scripts.bootstrap import ensure_user
+
+load_dotenv()
+user_id = asyncio.run(ensure_user(os.environ['DATABASE_URL'], 'Carol', 'carol-prod-key'))
+print(f'user_id={user_id}')
+"
+```
+
+Hand `carol-prod-key` to Carol; she sends it as `X-API-Key` on every
+request from then on. Nothing else to configure — the in-memory
+`api_key -> user_id` cache (`api/auth.py`) is loaded once at process
+startup, so a newly provisioned key needs the API process restarted (or,
+in production, the next natural redeploy) before it's recognized.
+
+## Frontend
+
+`frontend/` is a Vite + React app -- a pure HTTP consumer of the API above.
+It imports nothing from `engine/`, never touches Postgres, and the system
+works fully with `frontend/` deleted (CLAUDE.md's frontend boundary rule).
+See [Quickstart — Local](#quickstart--local) and
+[Quickstart — GitHub Codespaces](#quickstart--github-codespaces) above for
+running it in dev.
+
+### Theme
+
+Dark is the default (an ops console reads as dark by default), but light
+mode is fully supported: it follows the OS/browser's `prefers-color-scheme`
+automatically, and Settings has an explicit System/Light/Dark toggle. The
+toggle is session-only React state, not persisted -- the brief reserves
+`localStorage` for the API key alone, so a forced theme resets to
+"System" on next load rather than being written anywhere.
+
+### Building for production
+
+```
+cd frontend
+npm run build
+```
+
+Emits `frontend/dist`. **How it's served:** `api/main.py` mounts
+`frontend/dist/assets` as static files and serves `frontend/dist/index.html`
+for every other path that isn't a recognised API route (registered last,
+after every real endpoint, so `/tasks`, `/events`, etc. always take
+precedence over the SPA fallback). One container, one process, no CORS
+needed in production since the frontend and API share an origin. In dev,
+`frontend/dist` doesn't exist yet, so FastAPI skips that block entirely and
+the Vite dev server serves the frontend instead.
+
+The existing CORS config (`http://localhost:5173`, plus `FRONTEND_ORIGIN`
+if set) stays in place for local dev, where the frontend and API run as
+two separate processes on two different ports.
 
 ## Architecture
 
@@ -142,228 +449,119 @@ sequenceDiagram
 
 The reaper runs on boot **and** on a timer — boot-only recovery would miss a worker that hung rather than died.
 
-## Setup & Running Locally
-
-### Environment variables
-
-All read from `.env` (see `.env.example`) via `python-dotenv`:
-
-| Variable            | Default | Purpose                                                        |
-|---------------------|---------|-----------------------------------------------------------------|
-| `DATABASE_URL`      | —       | Postgres DSN, `postgresql://user:pass@host:port/db`             |
-| `CONCURRENCY_LIMIT`  | `2`     | Max tasks running at once, this process                        |
-| `LEASE_SECONDS`      | `30`    | How long a claimed task's lease lives before the reaper reclaims it |
-| `HEARTBEAT_INTERVAL` | `10`    | How often a running task's lease is renewed                    |
-| `MAX_ATTEMPTS`       | `3`     | Attempts (including the first) before a retryable failure gives up |
-| `LOG_LEVEL`          | `INFO`  | Root logger level — `DEBUG` for verbose per-poll dispatch noise, `INFO` to see claims, retries, cancellations, and reaper reclaims without the noise |
-
-### Database schema
-
-`sql/schema.sql` is the single source of truth for the database, applied by
-hand — there's no migration tooling and no `docker-entrypoint-initdb.d` init
-script wired into `docker-compose.yml` (see DECISIONS.md, "Raw SQL via
-asyncpg rather than an ORM": migrations were a deliberate non-goal for this
-proof of concept). After `docker compose up -d`, apply it once:
-
-```
-docker compose exec postgres psql -U jobrunner -d jobrunner -f - < sql/schema.sql
-```
-
-**If you already have a running database from before `tasks.seq` was added**
-(the monotonic ordering column — see DECISIONS.md, "Handle resolution
-ordering uses a monotonic sequence, not a timestamp"), a fresh `schema.sql`
-apply won't retroactively add it to an existing table. Run the one statement
-by hand instead:
-
-```
-docker compose exec postgres psql -U jobrunner -d jobrunner -c "ALTER TABLE tasks ADD COLUMN seq BIGSERIAL;"
-```
-
-Same end state either way — a fresh clone gets `seq` from `schema.sql`
-directly; an existing database gets there via this one `ALTER TABLE`. Worth
-keeping in mind if `schema.sql` picks up further changes later: without
-migration tooling, every existing database needs its own hand-applied catch-up
-statement, not just new ones.
-
-### Seed data
-
-`scripts/seed.py` creates two named demo users and a realistic spread of
-tasks across every status, so the dashboard's filtering, sorting, and detail
-views have something meaningful to show without needing to manually drive
-jobs through the API first. Run it once the schema is applied and the API's
-dependencies are installed:
-
-```
-python -m scripts.seed
-```
-
-This creates:
-
-- **Two users** — `Alice` (`X-API-Key: alice-demo-key`) and `Bob`
-  (`X-API-Key: bob-demo-key`). A bare run never touches any other user —
-  it only ever creates/updates these two and inserts their tasks.
-- **~28 tasks for Alice, ~7 for Bob** — every status represented
-  (`queued`, `running`, `ready`, `failed`, `cancelled`), both lanes
-  (`scrape`, `report`), a mix of collected/uncollected terminal tasks, and
-  `created_at` spread across the last two weeks so date-range filtering has
-  something to filter. Every failed row has a distinct, honest reason
-  (some exhausted-retry wording, some permanent), and every task has a
-  plausible `task_events` history backing its detail view.
-- Every seeded row has `seeded: true` (returned by both `GET /tasks` and
-  `GET /tasks/{handle}` — additive extras on top of the 9 fixed contract
-  fields, see DECISIONS.md) so it's never mistaken for real activity.
-
-Rows are inserted directly via SQL, not through `engine.submit()` — a
-seeded `queued` row would otherwise get claimed and actually "run" the
-moment the app starts. The couple of seeded `queued` rows carry a
-`not_before` decades in the future for the same reason, and the one seeded
-`running` row carries a `lease_expires_at` decades in the future so the
-reaper doesn't reclaim it on boot.
-
-**Those seeded `queued` rows are permanently inert, on purpose.** With
-`not_before` decades out, the dispatch loop's `claim_next` will never
-select them — they'll sit in `queued` forever, not just until the next
-poll. That's deliberate (see above: a real `queued` row would get claimed
-and run within a second of boot, defeating the point of seed data looking
-like seed data), but it reads as a stuck job if you don't know why when
-filtering the dashboard by `status=queued`. A couple are kept specifically
-so that filter has something to show; the `SEEDED` badge is what tells you
-they're not actually stuck.
-
-Flags:
-
-```
-python -m scripts.seed --reset               # delete existing seeded rows, then reseed fresh ones
-python -m scripts.seed --clear               # delete existing seeded rows and STOP -- no reseed
-python -m scripts.seed --wipe                # delete ALL rows (tasks + users), asks for confirmation, then reseeds
-python -m scripts.seed --purge-debug-users   # delete non-demo, non-test-fixture users; previews and asks first
-```
-
-`--reset` and `--clear` both delete every `seeded = true` row — the
-difference is only what happens next. `--reset` reseeds immediately
-afterward, so you end up back where you started with a fresh batch (new
-timestamps, same shape). `--clear` stops right there, so you end up with
-*no* seed data at all — useful for a demo/recording where you want to
-show the dashboard against a clean slate, or against only your own real
-traffic, before seeding it back in later with a bare `python -m
-scripts.seed`. `--reset`, `--clear`, and `--wipe` are mutually exclusive
-(the script rejects combining them, rather than one silently winning).
-
-`--purge-debug-users` exists for cleaning up ad-hoc users left behind by
-manual testing (e.g. a one-off key created by hand while poking at the API).
-It is opt-in only — a bare run, and even `--reset`/`--clear`, never delete
-another user — and it always prints exactly who it found and how many tasks
-they have before asking for confirmation, since deleting a user cascades to
-their real (non-seed) task data too. It can be combined with `--clear` (both
-are cleanup-only operations); combined with `--reset` or `--wipe`, both still
-run in the same order — the purge, then the reseed.
-
-### Known issues
-
-**Docker Desktop + WSL2: pulls fail with truncated layers.** Docker Desktop's containerd image store mishandles range-requested downloads over WSL2, causing `httpReadSeeker: failed open ... EOF` mid-pull. Affects both Windows 10 and 11. Fix: in Docker Desktop, **Settings → General**, disable **"Use containerd for pulling and storing images"**, then Apply & Restart.
-
-## API Reference
-
-### Provisioning a real user's API key
-
-There is deliberately no signup flow — no registration form, no email
-verification, no key rotation (see DECISIONS.md, "Auth beyond API
-keys... no signup, login, password reset, or key rotation"). The brief
-asks for "a per-user API key scoped to that user's data," not a user
-management system, so keys are provisioned by an operator, out of band.
-
-Every current caller that needs a user — `scripts/seed.py`'s demo users,
-the API's own seeded users at startup, the pytest fixtures — goes through
-the same idempotent function: `scripts.bootstrap.ensure_user(dsn, name,
-api_key)`. It's `INSERT ... ON CONFLICT (api_key) DO UPDATE ... RETURNING
-id` — safe to run again with the same key, and the only place a user row
-gets created. There's no CLI wrapper around it (nothing here needed one
-until this point), so an operator provisioning a new real user runs it
-directly:
-
-```
-python -c "
-import asyncio, os
-from dotenv import load_dotenv
-from scripts.bootstrap import ensure_user
-
-load_dotenv()
-user_id = asyncio.run(ensure_user(os.environ['DATABASE_URL'], 'Carol', 'carol-prod-key'))
-print(f'user_id={user_id}')
-"
-```
-
-Hand `carol-prod-key` to Carol; she sends it as `X-API-Key` on every
-request from then on. Nothing else to configure — the in-memory
-`api_key -> user_id` cache (`api/auth.py`) is loaded once at process
-startup, so a newly provisioned key needs the API process restarted (or,
-in production, the next natural redeploy) before it's recognized.
-
-## Frontend
-
-`frontend/` is a Vite + React app -- a pure HTTP consumer of the API above.
-It imports nothing from `engine/`, never touches Postgres, and the system
-works fully with `frontend/` deleted (CLAUDE.md's frontend boundary rule).
-
-### Running in dev
-
-```
-cd frontend
-npm install
-npm run dev
-```
-
-Opens on `http://localhost:5173`. The Vite dev server proxies `/tasks`,
-`/lanes`, `/events`, and `/health` to the FastAPI backend on
-`http://localhost:8000` (see `frontend/vite.config.js`) -- start the API
-separately:
-
-```
-uvicorn api.main:app --reload
-```
-
-On first load you'll land on a card asking for an API key -- use the
-seeded demo keys (`alice-demo-key` / `bob-demo-key`, shown as hints on the
-card itself) or run `python -m scripts.seed` first if the database is
-empty.
-
-### Theme
-
-Dark is the default (an ops console reads as dark by default), but light
-mode is fully supported: it follows the OS/browser's `prefers-color-scheme`
-automatically, and Settings has an explicit System/Light/Dark toggle. The
-toggle is session-only React state, not persisted -- the brief reserves
-`localStorage` for the API key alone, so a forced theme resets to
-"System" on next load rather than being written anywhere.
-
-### Building for production
-
-```
-cd frontend
-npm run build
-```
-
-Emits `frontend/dist`. **How it's served:** `api/main.py` mounts
-`frontend/dist/assets` as static files and serves `frontend/dist/index.html`
-for every other path that isn't a recognised API route (registered last,
-after every real endpoint, so `/tasks`, `/events`, etc. always take
-precedence over the SPA fallback). One container, one process, no CORS
-needed in production since the frontend and API share an origin. In dev,
-`frontend/dist` doesn't exist yet, so FastAPI skips that block entirely and
-the Vite dev server serves the frontend instead.
-
-The existing CORS config (`http://localhost:5173`, plus `FRONTEND_ORIGIN`
-if set) stays in place for local dev, where the frontend and API run as
-two separate processes on two different ports.
-
-## Testing
-
 ## Deployment
+
+**Live URL:** https://job-runner-app.mangobush-0fc2a290.eastus.azurecontainerapps.io
+
+Demo keys (same as local dev): `X-API-Key: alice-demo-key` / `X-API-Key: bob-demo-key`.
+
+### Architecture
+
+One container, one process: `uvicorn` serves both the API and the built
+frontend (`api/main.py`'s `StaticFiles` mount + SPA fallback — see
+"Building for production" above). Single Azure Container Apps replica
+(`min-replicas 1, max-replicas 1` — see CLAUDE.md and DECISIONS.md,
+"single-replica by design": two replicas would mean two worker pools
+sharing one queue, silently doubling the effective concurrency limit and
+breaking the concurrency-limit acceptance criterion; scale-to-zero would
+stop the pool entirely between requests). Backed by a single Azure
+Database for PostgreSQL flexible server (Burstable B1ms).
+
+### Image
+
+Built by the root `Dockerfile`, a two-stage build:
+
+1. `node:20-alpine` — `npm ci` + `npm run build` against `frontend/`, producing `frontend/dist`.
+2. `python:3.12-slim` — installs `requirements.txt`, copies `engine/`, `api/`, `scripts/`, `sql/`, and the built `frontend/dist` from stage 1.
+
+The frontend is built **inside** the image on every build, never pushed
+from a local `npm run build` — otherwise the served bundle could silently
+go stale relative to the source it was supposedly built from. `CMD` runs
+`uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}`; Azure
+Container Apps' ingress targets port 8000.
+
+### Azure resources
+
+| Resource | Name | Notes |
+|---|---|---|
+| Resource group | `rg-job-runner` | `eastus` |
+| Postgres flexible server | `jobrunner-pg-c1ae5c` | Burstable B1ms, Postgres 16, `canadacentral` (the subscription's `eastus` quota rejected this resource type — see below) |
+| Database | `jobrunner` | schema applied by hand from `sql/schema.sql`, then seeded via `scripts/seed.py` |
+| Container registry | `tradingbotregistry9212.azurecr.io` | pre-existing registry, reused rather than creating a second one |
+| Container Apps environment | `job-runner-env` | `eastus` |
+| Container App | `job-runner-app` | `min-replicas 1, max-replicas 1`, external ingress, target port 8000 |
+
+**Env vars** (`DATABASE_URL` is a Container Apps *secret*, referenced via
+`secretRef`, never a plain env var — matches CLAUDE.md's requirement):
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | secret `database-url`, the Postgres flexible server's connection string (`sslmode=require`) |
+| `CONCURRENCY_LIMIT` | `2` |
+| `LEASE_SECONDS` | `50` |
+| `HEARTBEAT_INTERVAL` | `10` |
+| `MAX_ATTEMPTS` | `3` |
+| `LOG_LEVEL` | `INFO` |
+
+### Deploying (reproducing this from scratch)
+
+```
+# 1. build & push
+docker build -t tradingbotregistry9212.azurecr.io/job-runner:<tag> .
+az acr login -n tradingbotregistry9212
+docker push tradingbotregistry9212.azurecr.io/job-runner:<tag>
+
+# 2. Postgres (one-time)
+az group create -n rg-job-runner -l eastus
+az postgres flexible-server create -g rg-job-runner -n <server-name> \
+  --location canadacentral --admin-user <user> --admin-password <pass> \
+  --sku-name Standard_B1ms --tier Burstable --storage-size 32 --version 16 \
+  --public-access 0.0.0.0
+# schema.sql uses pgcrypto (gen_random_uuid()) -- Azure Postgres requires
+# extensions to be allow-listed before CREATE EXTENSION will succeed:
+az postgres flexible-server parameter set -g rg-job-runner -s <server-name> \
+  --name azure.extensions --value PGCRYPTO
+# temporarily open the firewall to your own IP, apply sql/schema.sql and
+# run `python -m scripts.seed` against the deployed DATABASE_URL, then
+# remove that firewall rule again -- the "AllowAllAzureServicesAndResourcesWithinAzureIps"
+# rule from --public-access 0.0.0.0 is what the running Container App
+# actually connects through.
+
+# 3. Container Apps
+az containerapp env create -g rg-job-runner -n job-runner-env --location eastus
+az containerapp create -g rg-job-runner -n job-runner-app \
+  --environment job-runner-env \
+  --image tradingbotregistry9212.azurecr.io/job-runner:<tag> \
+  --target-port 8000 --ingress external \
+  --registry-server tradingbotregistry9212.azurecr.io \
+  --registry-username <acr-user> --registry-password <acr-pass> \
+  --min-replicas 1 --max-replicas 1 \
+  --secrets database-url=<dsn> \
+  --env-vars DATABASE_URL=secretref:database-url CONCURRENCY_LIMIT=2 \
+    LEASE_SECONDS=50 HEARTBEAT_INTERVAL=10 MAX_ATTEMPTS=3 LOG_LEVEL=INFO
+```
+
+### Verified against the deployed URL
+
+- Frontend loads at `/` (not a 404); direct navigation to a client-side
+  route (e.g. `/some/client/route`) also serves `index.html` via the SPA
+  fallback, not a 404.
+- `alice-demo-key` / `bob-demo-key` authenticate and return each user's
+  own seeded tasks only.
+- `POST /tasks` returns `202` with a `queued` task well before the job
+  finishes; polling the handle shows it progress to `running` then
+  `ready` with a populated `result` and full `state_history`.
+- `POST /tasks/{handle}/cancel` on a `running` task returns `cancelled`
+  immediately, no later `ready` event follows.
+- `GET /events` streams `: ping` comment lines every 15s and was held
+  open past ACA's idle-connection window (multi-minute idle check) with
+  no drop — this is the one most likely to fail *only* in production
+  (proxies/load balancers between the client and the app, not present in
+  local dev), so it was checked directly against the deployed URL rather
+  than assumed from the local pass.
 
 ## Decisions & Tradeoffs
 
 See `DECISIONS.md` for the full log of forks resolved during the build, with options considered and why.
-
-## Demo
 
 ## What I'd Do Next
