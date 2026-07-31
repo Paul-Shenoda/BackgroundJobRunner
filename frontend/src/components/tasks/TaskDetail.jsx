@@ -1,5 +1,6 @@
 import { useTaskDetail } from "../../hooks/useTaskDetail";
 import { useElapsedSeconds, formatElapsed } from "../../hooks/useElapsedSeconds";
+import { useTasks } from "../../context/TasksContext";
 import { absoluteTime, relativeTime } from "../../lib/format";
 import StatusPill from "../StatusPill";
 import { IconBack, IconAlert, IconClose } from "../icons";
@@ -12,13 +13,33 @@ function runningSince(stateHistory) {
 }
 
 export default function TaskDetail({ task: selectedTask, onBack }) {
-  const { handle, createdAt } = selectedTask;
+  const { handle, createdAt, row } = selectedTask;
   const taskKey = `${handle}::${createdAt ?? ""}`;
-  const { task, loading, error, actionError, clearActionError, cancel, retry, collect } =
+  const { task: fetched, loading, error, actionError, clearActionError, cancel, retry, collect } =
     useTaskDetail(handle, taskKey);
+  const { tasks: listTasks } = useTasks();
+
+  // GET /tasks/{handle} resolves active-first: when the clicked row is a
+  // HISTORICAL one under a recycled handle, the fetch legitimately returns
+  // a DIFFERENT task that now holds the same handle string (see
+  // DECISIONS.md, "a handle identifies an active task, not a task" — the
+  // fixed contract has no way to address one specific historical row).
+  // created_at is the identity check: assigned once at INSERT, never
+  // updated, part of the public contract. When it disagrees, showing the
+  // fetched row here would be showing (and offering actions against) a
+  // task the operator did not select.
+  const recycled = createdAt != null && fetched != null && fetched.created_at !== createdAt;
+
+  // For a recycled handle, render the clicked row's own data. Prefer the
+  // freshest copy from the live task list (refetched on every event) over
+  // the snapshot captured at click time, so e.g. a `collected` flag that
+  // flipped since the click still reads correctly.
+  const task = recycled
+    ? (listTasks.find((t) => t.handle === handle && t.created_at === createdAt) ?? row)
+    : fetched;
 
   const elapsedSeconds = useElapsedSeconds(
-    task?.status === "running" ? runningSince(task.state_history) : null
+    !recycled && task?.status === "running" ? runningSince(task.state_history) : null
   );
 
   return (
@@ -52,6 +73,17 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
 
         {task && (
           <div className="flex flex-col gap-5 p-4">
+            {recycled && (
+              <div className="rounded-lg border border-[color:var(--color-accent)]/30 bg-[color:var(--color-accent-soft)] p-3 text-xs text-[color:var(--color-ink)]">
+                <p className="font-semibold">This handle has been recycled.</p>
+                <p className="mt-1">
+                  You're viewing a historical row — <span className="font-mono-tabular">{handle}</span>{" "}
+                  was released ({row?.status === "cancelled" ? "cancelled" : "collected"}) and now
+                  names a newer task. Actions are disabled for historical rows.
+                </p>
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center gap-2">
               <StatusPill status={task.status} />
               <span className="rounded bg-[color:var(--color-surface-raised)] px-2 py-0.5 text-xs text-[color:var(--color-ink-dim)]">
@@ -82,7 +114,10 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
               </div>
             )}
 
-            <Actions task={task} cancel={cancel} retry={retry} collect={collect} />
+            {/* Never render actions for a historical row: cancel/collect/
+                retry all address the handle, and the API would apply them
+                to the ACTIVE task holding it — not the row on screen. */}
+            {!recycled && <Actions task={task} cancel={cancel} retry={retry} collect={collect} />}
 
             {actionError && (
               <div className="flex items-start justify-between gap-2 rounded-lg border border-[color:var(--color-failed)]/40 bg-[color:var(--color-failed-soft)] px-3 py-2 text-xs text-[color:var(--color-failed)]">
@@ -120,6 +155,15 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
               </Section>
             )}
 
+            {recycled ? (
+              <Section label="State history">
+                <p className="text-xs text-[color:var(--color-ink-dim)]">
+                  Not available for a historical row — the API resolves{" "}
+                  <span className="font-mono-tabular">{handle}</span> to the task currently
+                  holding it, so this row's history can no longer be addressed.
+                </p>
+              </Section>
+            ) : (
             <Section label="State history">
               <div className="flex flex-col gap-2">
                 {task.state_history.map((entry, i) => (
@@ -147,6 +191,7 @@ export default function TaskDetail({ task: selectedTask, onBack }) {
                 ))}
               </div>
             </Section>
+            )}
           </div>
         )}
       </div>

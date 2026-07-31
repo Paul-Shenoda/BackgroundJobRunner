@@ -36,6 +36,20 @@ export default function TaskList() {
     );
   }
 
+  // Handles recycle (CLAUDE.md), so the visible list can contain several
+  // rows sharing one handle string -- at most one of them active (the
+  // partial unique index guarantees that), the rest historical. Adjacent
+  // duplicates LOOK like the exact collision the brief forbids, so the
+  // historical ones get an explicit "recycled" marker. "Holds the handle"
+  // mirrors uniq_active_handle's predicate: queued/running, or
+  // ready/failed and not yet collected.
+  const handleCounts = new Map();
+  for (const t of tasks) handleCounts.set(t.handle, (handleCounts.get(t.handle) ?? 0) + 1);
+  const holdsHandle = (t) =>
+    t.status === "queued" ||
+    t.status === "running" ||
+    ((t.status === "ready" || t.status === "failed") && !t.collected);
+
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
       {tasks.map((task) => (
@@ -45,7 +59,11 @@ export default function TaskList() {
         // plus a new active one that reused the number). created_at
         // differs between them, so pairing it with handle keeps React's
         // keys actually unique instead of colliding.
-        <TaskRow key={`${task.handle}-${task.created_at}`} task={task} />
+        <TaskRow
+          key={`${task.handle}-${task.created_at}`}
+          task={task}
+          recycled={handleCounts.get(task.handle) > 1 && !holdsHandle(task)}
+        />
       ))}
       {hasMore && (
         <button

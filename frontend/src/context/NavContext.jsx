@@ -25,9 +25,18 @@ export function NavProvider({ children }) {
   const openTask = useCallback((taskOrHandle) => {
     setView("tasks");
     if (typeof taskOrHandle === "string") {
-      setSelectedTask({ handle: taskOrHandle, createdAt: null });
+      setSelectedTask({ handle: taskOrHandle, createdAt: null, row: null });
     } else {
-      setSelectedTask({ handle: taskOrHandle.handle, createdAt: taskOrHandle.created_at });
+      // Keep the full clicked row, not just its identity: GET
+      // /tasks/{handle} always resolves to the row currently holding the
+      // handle (active-first), so when the clicked row is a HISTORICAL one
+      // under a recycled handle, this stored row is the only source of
+      // data the detail pane has for what the operator actually selected.
+      setSelectedTask({
+        handle: taskOrHandle.handle,
+        createdAt: taskOrHandle.created_at,
+        row: taskOrHandle,
+      });
     }
   }, []);
 

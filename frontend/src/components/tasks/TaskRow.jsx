@@ -4,7 +4,7 @@ import StatusPill from "../StatusPill";
 import { IconCheck } from "../icons";
 import { useNav } from "../../context/NavContext";
 
-export default function TaskRow({ task }) {
+export default function TaskRow({ task, recycled = false }) {
   const { openTask, selectedTask } = useNav();
   const meta = STATUS_META[task.status] ?? STATUS_META.queued;
   // Composite identity, not handle alone -- two rows can legitimately
@@ -35,13 +35,26 @@ export default function TaskRow({ task }) {
       }
       style={{ borderLeft: `3px solid ${meta.color}` }}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-3">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <span className="shrink-0 font-mono-tabular text-sm font-medium text-[color:var(--color-ink)]">
           {task.handle}
         </span>
         <span className="shrink-0 rounded bg-[color:var(--color-surface-raised)] px-1.5 py-0.5 text-[11px] text-[color:var(--color-ink-dim)]">
           {task.lane}
         </span>
+        {recycled && (
+          // A glyph, not the word: rows carrying SEEDED + attempts + a
+          // status pill already fill the 420px desktop column, and one
+          // more worded chip overflows it. The full explanation lives in
+          // the detail pane's banner; this only needs to whisper
+          // "duplicate handle is history, not a collision" in place.
+          <span
+            className="shrink-0 text-xs leading-none text-[color:var(--color-ink-faint)]"
+            title={`Handle recycled -- this task's number was released and later reused, so ${task.handle} now names a different task. This row is history, not a collision.`}
+          >
+            ↻
+          </span>
+        )}
         {task.seeded && (
           <span
             className="shrink-0 rounded bg-[color:var(--color-accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-[color:var(--color-accent)]"
@@ -56,14 +69,19 @@ export default function TaskRow({ task }) {
         )}
       </div>
 
-      <div className="flex shrink-0 items-center gap-3">
+      <div className="flex shrink-0 items-center gap-2">
         {task.attempts > 1 && (
           <span className="font-mono-tabular text-xs text-[color:var(--color-ink-faint)]">
             {task.attempts}/{task.max_attempts}
           </span>
         )}
         <StatusPill status={task.status} size="sm" />
-        {task.collected && (
+        {/* The recycled glyph already means "released" (a handle only
+            recycles after collect/cancel), so the collected check is
+            redundant on those rows -- and the seeded+recycled+attempts
+            combination is exactly the row that runs out of width at
+            phone/list-column sizes. */}
+        {task.collected && !recycled && (
           <IconCheck
             className="shrink-0 text-[color:var(--color-ink-faint)]"
             title="Collected -- this handle has been released"
