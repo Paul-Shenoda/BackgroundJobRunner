@@ -638,10 +638,9 @@ See `DECISIONS.md` for the full log of forks resolved during the build, with opt
 
 In rough priority order (each expanded in `DECISIONS.md`, "What I'd do next"):
 
-- **Multi-replica workers** with a cluster-wide concurrency budget rather than a per-process one. The lease design already supports multiple claimers safely (`FOR UPDATE SKIP LOCKED`); what's missing is coordinating the *limit* across replicas.
-- **Idempotency keys on the worker contract**, so at-least-once execution becomes safe for workers with real side effects.
-- **Atomic handle allocation** — collapse compute-lowest-free-number + INSERT into one statement, replacing the retry-with-jittered-backoff loop entirely rather than bounding it (see DECISIONS.md, "Handle-allocation retry budget 5 → 25").
-- **A delta endpoint** (`GET /tasks?updated_since=`) so reconnects don't need a full list refetch as the task table grows.
-- **Scheduled and recurring jobs** — the `not_before` column used for retry backoff is already most of the mechanism needed for "run this at 3am."
-- **Per-lane parameter schemas** with server-side validation, worth building the moment there's a real worker whose params actually matter. Until then params are opaque by design — which also means `duration_ms: 10**18` is accepted and will occupy a concurrency slot until cancelled; a documented limitation, not an oversight.
-- **Structured metrics** — queue depth, time-to-claim, worker utilisation, retry rates — the brief's emphasis on observability naturally extends past the dashboard into instrumentation.
+- **Run more than one copy of the server at once.** Right now the concurrency limit only applies within a single running process. The groundwork (leases) is already there — it just needs a way for multiple copies to agree on one shared limit instead of each enforcing its own.
+- **Make it safe to accidentally run a job twice.** If the process dies mid-job, the job just starts over from scratch. That's fine for a fake worker that only sleeps, but a real one (say, a worker that charges a credit card) would need a way to know "I already did this" so it doesn't repeat side effects.
+- **Let the dashboard catch up efficiently after being offline.** Right now, reconnecting means re-downloading the whole task list. A "what changed since I left" endpoint would make that much lighter as the list grows.
+- **Let people schedule jobs for later**, not just submit them immediately — "run this at 3am" kind of thing. Most of the plumbing for this already exists, since retry-delay already works the same way.
+- **Validate a job's input before accepting it**, tailored to each job type. Worth doing once there's a real worker where bad input would actually matter.
+- **Track basic health numbers over time** — how long jobs wait, how busy the workers are, how often things get retried — so problems show up in a graph instead of only in the logs.
