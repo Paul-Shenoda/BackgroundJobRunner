@@ -630,6 +630,21 @@ az containerapp create -g rg-job-runner -n job-runner-app \
   local dev), so it was checked directly against the deployed URL rather
   than assumed from the local pass.
 
+## Build Timeline
+
+Built July 28–31, 2026, one layer at a time in dependency order: each layer was finished and reviewed before the next was built on top of it.
+
+| Phase | When | What |
+|---|---|---|
+| 1. Foundation | Jul 28, evening | Schema, indexes and architecture diagrams, before any engine code. |
+| 2. Orchestration engine | Jul 28 – Jul 29 | Built bottom-up in two commits: models, store, handles, registry and events, then runner, engine facade, mock worker and a smoke test. A review before starting the API closed a poison-job protection gap and replaced `created_at` with a monotonic `seq`, so handle resolution is ordered deterministically. |
+| 3. API layer | Jul 29, late | Auth, schemas, the six routes, app wiring and the SSE endpoint. |
+| 4. Test suite | Jul 30, early morning | Tests for every acceptance criterion plus contract, isolation and event-stream coverage, all against the HTTP API, with the restart test killing and respawning a real process. They caught a lease-to-heartbeat ratio that could reclaim a running job. |
+| 5. Seed data | Jul 30, morning | Demo users and tasks, plus the `seeded` flag on the detail endpoint. |
+| 6. Frontend | Jul 30, afternoon | React/Vite dashboard served by FastAPI in production, followed by layout and refresh fixes. |
+| 7. Operations & deployment | Jul 31, morning | Logging for the reaper, dispatch and SSE; Azure Container Apps deployment; Codespaces setup; `scripts/provision_user.py`. |
+| 8. Edge-case hardening | Jul 31, afternoon | Handle-allocation retry budget raised from 5 to 25 with jittered backoff, bounded `GET /tasks` pagination, correct display of recycled handles, and live updates during retry cycles. |
+
 ## Decisions & Tradeoffs
 
 See `DECISIONS.md` for the full log of forks resolved during the build, with options considered and why.
