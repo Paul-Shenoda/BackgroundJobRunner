@@ -17,6 +17,18 @@ import asyncpg
 
 from engine.models import Status, Task, TaskError, TaskEvent
 
+# Errors that mean "the database is briefly unreachable" (e.g. Postgres restarting for
+# maintenance: "the database system is shutting down", refused or dropped connections,
+# timeouts), as opposed to "this query is wrong". The worker pool's background loops back
+# off and retry on these instead of dying. Defined here so asyncpg stays confined to this
+# module (see README, "Module boundaries").
+TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (
+    asyncpg.exceptions.OperatorInterventionError,  # CannotConnectNow, AdminShutdown, CrashShutdown
+    asyncpg.exceptions.PostgresConnectionError,  # SQLSTATE class 08, incl. ConnectionDoesNotExist
+    OSError,  # ConnectionRefusedError, ConnectionResetError, ...
+    TimeoutError,
+)
+
 
 class HandleConflict(Exception):
     """Raised by insert_task when the (user_id, lane, number) it tried to

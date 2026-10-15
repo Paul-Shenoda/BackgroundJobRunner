@@ -124,8 +124,13 @@ app.include_router(events_router)
 async def health():
     """Liveness only: is this process working, not how much work it's
     doing. engine.health() owns every decision here; this route is purely
-    parse (nothing to parse), delegate, serialise."""
-    return await app.state.engine.health()
+    parse (nothing to parse), delegate, serialise.
+
+    Responds 503 (same body) when the engine has stopped, so a liveness probe
+    can restart a process that still serves HTTP but no longer runs jobs. A
+    briefly unreachable database alone stays 200: the loops retry on their own."""
+    body = await app.state.engine.health()
+    return JSONResponse(status_code=503 if body["engine"] == "stopped" else 200, content=body)
 
 
 # Production: one container, one process. `npm run build` emits

@@ -15,9 +15,13 @@ from datetime import datetime, timedelta, timezone
 from engine.events import EventBus, LifecycleEvent
 from engine.models import Job, Status, Task, TaskError, WorkerResult
 from engine.registry import Worker, WorkerRegistry
-from engine.store import Store
+from engine.store import TRANSIENT_DB_ERRORS, Store
 
 logger = logging.getLogger(__name__)
+
+# Backoff for the background loops when the database is briefly unreachable.
+_DB_RETRY_INITIAL = 1.0
+_DB_RETRY_MAX = 30.0
 
 
 class WorkerPool:
@@ -147,14 +151,32 @@ class WorkerPool:
         quietly stop claiming any work with zero trace. That's exactly the
         silent-failure mode the brief rules out; logger.exception() here is
         what makes it loud instead.
+
+        Transient database outages (TRANSIENT_DB_ERRORS, e.g. Postgres restarting
+        for maintenance) are NOT crashes: the loop logs a warning, backs off
+        (1s doubling to 30s) and keeps claiming once the database is back.
+        Before this, a nightly Postgres restart killed the loop for good while
+        the process kept serving HTTP, so new jobs queued forever.
         """
+        backoff = _DB_RETRY_INITIAL
         try:
             while not self._shutdown.is_set():
                 if len(self._running) >= self._concurrency:
                     await asyncio.sleep(self._poll_interval)
                     continue
 
-                task = await self._store.claim_next(self._worker_id, self._lease_seconds)
+                try:
+                    task = await self._store.claim_next(self._worker_id, self._lease_seconds)
+                except TRANSIENT_DB_ERRORS as exc:
+                    logger.warning(
+                        "dispatch: database unavailable (%s: %s); retrying in %.0fs",
+                        type(exc).__name__, exc, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _DB_RETRY_MAX)
+                    continue
+                backoff = _DB_RETRY_INITIAL
+
                 if task is None:
                     await asyncio.sleep(self._poll_interval)
                     continue
@@ -472,11 +494,22 @@ class WorkerPool:
         in-flight rows before cancelling them — it cancels and leaves
         their leases to expire, accepting up to lease_seconds of delay
         before the next reap (boot-time or periodic) reclaims them.
+
+        Like the dispatch loop, a transient database outage is logged and
+        retried on the next tick (every lease_seconds / 2) instead of ending
+        the loop.
         """
         try:
             while not self._shutdown.is_set():
                 await asyncio.sleep(self._lease_seconds / 2)
-                recovered = await self._store.reap_expired_leases()
+                try:
+                    recovered = await self._store.reap_expired_leases()
+                except TRANSIENT_DB_ERRORS as exc:
+                    logger.warning(
+                        "reaper: database unavailable (%s: %s); retrying next tick",
+                        type(exc).__name__, exc,
+                    )
+                    continue
                 if recovered:
                     failed = [t for t in recovered if t.status == Status.FAILED]
                     logger.info(
