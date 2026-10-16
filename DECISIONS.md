@@ -552,6 +552,14 @@
 - **Tradeoff / cost:** No horizontal scaling, and the deployment is a single point of failure. Appropriate for a proof of concept; the lease design means removing this limit is a config change plus a per-replica concurrency recalculation, not a rewrite.
 - **Revisit if:** Throughput demands exceed one process — then concurrency becomes a cluster-wide budget rather than a per-process one.
 
+### [2026-10-16] — Scale to zero between visits
+- **Context:** The live deployment is a portfolio demo: its workers only sleep, and the data is seed data. Keeping one replica running around the clock cost money for a demo that is idle almost all the time.
+- **Options considered:** Keep `min-replicas 1` / allow `min-replicas 0` with `max-replicas` still 1.
+- **Chose:** `min-replicas 0, max-replicas 1`. This revises the previous entry's minimum only; the maximum stays at one, so the single worker pool and the concurrency limit are unchanged.
+- **Why:** Scale-to-zero removes the idle cost. While a visitor has the dashboard open, its live event stream keeps the replica awake, so jobs they submit run normally.
+- **Tradeoff / cost:** The first request after an idle period takes about 20 seconds while the container starts. Jobs queued when everyone leaves wait in Postgres until the next request wakes the app; they are not lost (the reaper and leases already handle a process that stopped).
+- **Revisit if:** The runner does real work that must finish without a visitor present — then go back to `min-replicas 1`.
+
 ### [2026-07-28] — Engine as a standalone module; API layer imports only its facade
 - **Context:** The brief requires the engine to be usable with the frontend deleted, and grades the cleanliness of that boundary.
 - **Options considered:** Route handlers talk to the store directly where convenient / all routes go through a single engine facade object.

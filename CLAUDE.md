@@ -8,7 +8,7 @@ Constraints for this repo. Read before writing code. These are decided — imple
 
 A background job runner: submit a job, get a short handle back immediately, work runs in a pool under a concurrency limit, state survives restarts, lifecycle events stream to clients. Take-home assessment; the **orchestration engine is what's evaluated hardest**, followed by handle logic and durability.
 
-Stack: Python 3.12 · FastAPI · Postgres (asyncpg, raw SQL) · React frontend · deployed to Azure Container Apps, single replica.
+Stack: Python 3.12 · FastAPI · Postgres (asyncpg, raw SQL) · React frontend · deployed to Azure Container Apps, single replica that scales to zero between visits.
 
 ---
 

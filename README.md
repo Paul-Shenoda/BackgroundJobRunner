@@ -530,11 +530,13 @@ Demo keys (same as local dev): `X-API-Key: alice-demo-key` / `X-API-Key: bob-dem
 One container, one process: `uvicorn` serves both the API and the built
 frontend (`api/main.py`'s `StaticFiles` mount + SPA fallback — see
 "Building for production" above). Single Azure Container Apps replica
-(`min-replicas 1, max-replicas 1` — see CLAUDE.md and DECISIONS.md,
+(`min-replicas 0, max-replicas 1` — see CLAUDE.md and DECISIONS.md,
 "single-replica by design": two replicas would mean two worker pools
 sharing one queue, silently doubling the effective concurrency limit and
-breaking the concurrency-limit acceptance criterion; scale-to-zero would
-stop the pool entirely between requests). Backed by a single Azure
+breaking the concurrency-limit acceptance criterion). It scales to zero
+between visits to save cost, so the first request takes about 20 seconds
+to wake it, and queued jobs wait in Postgres until then ("Scale to zero
+between visits" in DECISIONS.md). Backed by a single Azure
 Database for PostgreSQL flexible server (Burstable B1ms).
 
 ### Image
@@ -559,7 +561,7 @@ Container Apps' ingress targets port 8000.
 | Database | `jobrunner` | schema applied by hand from `sql/schema.sql`, then seeded via `scripts/seed.py` |
 | Container registry | `tradingbotregistry9212.azurecr.io` | pre-existing registry, reused rather than creating a second one |
 | Container Apps environment | `job-runner-env` | `eastus` |
-| Container App | `job-runner-app` | `min-replicas 1, max-replicas 1`, external ingress, target port 8000 |
+| Container App | `job-runner-app` | `min-replicas 0, max-replicas 1` (scales to zero between visits), external ingress, target port 8000 |
 
 **Env vars** (`DATABASE_URL` is a Container Apps *secret*, referenced via
 `secretRef`, never a plain env var — matches CLAUDE.md's requirement):
@@ -605,7 +607,7 @@ az containerapp create -g rg-job-runner -n job-runner-app \
   --target-port 8000 --ingress external \
   --registry-server tradingbotregistry9212.azurecr.io \
   --registry-username <acr-user> --registry-password <acr-pass> \
-  --min-replicas 1 --max-replicas 1 \
+  --min-replicas 0 --max-replicas 1 \
   --secrets database-url=<dsn> \
   --env-vars DATABASE_URL=secretref:database-url CONCURRENCY_LIMIT=2 \
     LEASE_SECONDS=50 HEARTBEAT_INTERVAL=10 MAX_ATTEMPTS=3 LOG_LEVEL=INFO
